@@ -88,6 +88,13 @@ enum eap_tls_state {
     EAP_TLS_DONE,
 };
 
+/* EAP-TTLS phase 1 is the TLS handshake; phase 2 is the inner method
+   (AVPs) inside the established tunnel (RFC 5281 7.2). */
+enum eap_ttls_phase {
+    EAP_TTLS_PHASE1 = 0,
+    EAP_TTLS_PHASE2,
+};
+
 struct eap_hdr {
     u_char code;
     u_char identifier;
@@ -139,6 +146,7 @@ struct eap_session {
 #define EAP_F_TTLS_STARTED  0x200
 
     enum eap_tls_state tls_state;
+    enum eap_ttls_phase ttls_phase;	/* EAP-TTLS only; PHASE2 after the handshake */
     u_char ttls_version;	/* negotiated EAP-TTLS version, 0 for TTLSv0 */
     str_t identity;		/* EAP-Response/Identity, unauthenticated */
     SSL *ssl;

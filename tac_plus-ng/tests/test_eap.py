@@ -245,6 +245,9 @@ EAP_INVALID_LIMIT = 5
 # Fragment size of the test peer's own (client) flights. The server's limit
 # is EAP_DEFAULT_MTU, lowered by Framed-MTU.
 PEER_FRAGMENT = 3000
+# Fragment size of the EAP-TTLS peer helper (same limit, separate name used
+# by the TTLS tests).
+EAP_MAX_FRAGMENT = 3000
 EAP_DEFAULT_MTU = 1024
 FRAMED_MTU = 12
 
@@ -660,6 +663,11 @@ EAP_TTLS_POLICY = eap_policy(method="ttls", inner_method="pap",
                              identity_source="inner-identity", verify_client="no",
                              users=EAP_TTLS_USERS)
 
+# EAP-TTLS/PAP with a client certificate as well: verify-client = yes.
+EAP_TTLS_VERIFY_POLICY = eap_policy(method="ttls", inner_method="pap",
+                                    identity_source="inner-identity", verify_client="yes",
+                                    users=EAP_TTLS_USERS)
+
 # A second NAS in the same realm: EAP State must not be replayable from it.
 OTHER_NAS_DEVICE = """
 \tdevice other-nas {
@@ -926,8 +934,7 @@ class EapTlsPeer:
                 return reply
             self.expect_fragment_ack(reply)
 
-    @staticmethod
-    def parse_request(eap):
+    def parse_request(self, eap):
         """(identifier, flags, data, announced total) of an EAP-Request/EAP-TLS."""
         if len(eap) < 4:
             raise AssertionError("EAP-Request shorter than 4 bytes: %r" % eap)
@@ -1087,6 +1094,160 @@ class EapTlsPeer:
                 continue
             raise AssertionError("TLS handshake completed without a server alert")
         raise AssertionError("no TLS alert in %d rounds" % max_rounds)
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsPeer(EapTlsPeer):
+    """An EAP-TTLS peer over ssl.SSLObject and memory BIOs (TLS 1.2 only).
+
+    Every packet uses the TTLS header: type 21, the L/M/S flags and the
+    Version byte (RFC 5281 3.1). Server fragments are reassembled; each
+    fragment with M set is ACKed with an empty EAP-Response/EAP-TTLS. After
+    the TLS handshake the server starts phase 2 with an empty
+    EAP-Request/EAP-TTLS (no AVPs, Version 0). Task 20 does not parse inner
+    AVPs yet, so any phase-2 response is answered with EAP-Failure.
+    """
+
+    def parse_ttls_request(self, eap):
+        """(identifier, flags, version, data, announced total) of EAP-Request/TTLS."""
+        if len(eap) < 4:
+            raise AssertionError("EAP-Request shorter than 4 bytes: %r" % eap)
+        code, identifier, length = struct.unpack("!BBH", eap[:4])
+        if code != radius.EAP_REQUEST:
+            raise AssertionError("expected EAP-Request, got EAP code %d: %r" % (code, eap))
+        if length < 7 or length > len(eap):
+            raise AssertionError("bad EAP length %d in %r" % (length, eap))
+        if eap[4] != radius.EAP_TYPE_TTLS:
+            raise AssertionError("expected EAP-TTLS, got EAP type %d" % eap[4])
+        flags = eap[5]
+        version = eap[6]
+        off = 7
+        total = None
+        if flags & radius.EAP_TTLS_L:
+            if length < 11:
+                raise AssertionError("EAP-TTLS L flag without a 4-byte length")
+            total = struct.unpack("!I", eap[7:11])[0]
+            off = 11
+        return identifier, flags, version, eap[off:length], total
+
+    def expect_fragment_ack(self, reply):
+        """Expect an empty EAP-Request/EAP-TTLS ACK (flags 0, Version 0)."""
+        if reply.code_name != "Access-Challenge":
+            raise AssertionError("expected Access-Challenge fragment ACK, got %s: %r"
+                                 % (reply.code_name, radius.eap_from_reply(reply)))
+        identifier, flags, version, data, _ = self.parse_ttls_request(radius.eap_from_reply(reply))
+        if flags or version or data:
+            raise AssertionError("TTLS fragment ACK carried flags %#x, version %d, %d data bytes"
+                                 % (flags, version, len(data)))
+        self.client_fragment_acks += 1
+        self.identifier = identifier
+
+    def send_tls_flight(self, out):
+        """Send a client TLS flight with TTLS headers, fragmenting when needed."""
+        if len(out) <= EAP_MAX_FRAGMENT:
+            return self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                       self.identifier, 0, data=out))
+        total = len(out)
+        offset = 0
+        while True:
+            chunk = out[offset:offset + EAP_MAX_FRAGMENT]
+            first = offset == 0
+            offset += len(chunk)
+            more = offset < total
+            flags = radius.EAP_TTLS_L if first else 0
+            if more:
+                flags |= radius.EAP_TTLS_M
+            packet = radius.eap_ttls_packet(radius.EAP_RESPONSE, self.identifier,
+                                            flags, data=chunk, total=total)
+            reply = self.send_eap(packet)
+            if not more:
+                return reply
+            self.expect_fragment_ack(reply)
+
+    def receive_request(self, reply):
+        """One EAP-Request/EAP-TTLS, reassembling fragments; returns (identifier, data)."""
+        chunks = []
+        total = None
+        while True:
+            if reply.code_name != "Access-Challenge":
+                raise AssertionError("expected Access-Challenge, got %s: %r"
+                                     % (reply.code_name, radius.eap_from_reply(reply)))
+            identifier, flags, version, data, announced = self.parse_ttls_request(
+                radius.eap_from_reply(reply))
+            if version != radius.EAP_TTLS_VERSION:
+                raise AssertionError("server sent EAP-TTLS version %d" % version)
+            if announced is not None:
+                total = announced
+            if data:
+                self.tls_requests += 1
+            chunks.append(data)
+            if not flags & radius.EAP_TTLS_M:
+                break
+            self.fragment_acks += 1
+            reply = self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                         identifier, 0))
+        data = b"".join(chunks)
+        if total is not None and len(data) != total:
+            raise AssertionError("reassembled %d bytes, server announced %d" % (len(data), total))
+        self.identifier = identifier
+        return identifier, data
+
+    def start(self):
+        """Identity -> EAP-Request/EAP-TTLS Start; leaves peer.identifier at Start id."""
+        identity = radius.eap_packet(radius.EAP_RESPONSE, 1, radius.EAP_TYPE_IDENTITY,
+                                     self.identity.encode())
+        reply = self.send_eap(identity)
+        identifier, flags, version, data, _ = self.parse_ttls_request(radius.eap_from_reply(reply))
+        if flags != radius.EAP_TTLS_S or version != radius.EAP_TTLS_VERSION or data:
+            raise AssertionError("bad EAP-TTLS Start: flags %#x, version %d, %d data bytes"
+                                 % (flags, version, len(data)))
+        self.identifier = identifier
+
+    def handshake_phase2(self, max_rounds=10):
+        """Run the TLS handshake and return the empty phase-2 request.
+
+        Returns (final ACK identifier, phase-2 request identifier, reply).
+        RFC 5281 3.2: the peer ACKs the server's final TLS flight with an
+        empty EAP-Response/EAP-TTLS; the server then starts phase 2.
+        """
+        self.start()
+        for _ in range(max_rounds):
+            try:
+                self.sslobj.do_handshake()
+            except ssl.SSLWantReadError:
+                out = self.outgoing.read()
+                if not out:
+                    raise AssertionError("SSLObject wants to read but has no output for the server")
+                reply = self.send_tls_flight(out)
+                _, data = self.receive_request(reply)
+                self.incoming.write(data)
+                continue
+            except ssl.SSLWantWriteError:
+                self.outgoing.read()
+                continue
+            ack_identifier = self.identifier
+            reply = self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                         ack_identifier, 0))
+            if reply.code_name != "Access-Challenge":
+                raise AssertionError("expected the phase-2 Access-Challenge, got %s: %r"
+                                     % (reply.code_name, radius.eap_from_reply(reply)))
+            identifier, flags, version, data, _ = self.parse_ttls_request(
+                radius.eap_from_reply(reply))
+            if flags or version != radius.EAP_TTLS_VERSION or data:
+                raise AssertionError("bad phase-2 request: flags %#x, version %d, %d data bytes"
+                                     % (flags, version, len(data)))
+            return ack_identifier, identifier, reply
+        raise AssertionError("TLS handshake did not complete in %d rounds" % max_rounds)
+
+    def answer_alert(self, reply):
+        """Answer a TTLS Challenge carrying a TLS alert; returns the next reply."""
+        if reply.code_name != "Access-Challenge":
+            return reply
+        identifier, _, _, data, _ = self.parse_ttls_request(radius.eap_from_reply(reply))
+        if not data or data[0] != 21:
+            raise AssertionError("expected a TLS alert, got %r" % data[:8])
+        return self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE, identifier, 0))
 
 
 @unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
@@ -1330,6 +1491,99 @@ class EapTtlsStart(EapTlsTestCase):
         reply = c.exchange(access_request(tls, state), message_authenticator=True)
         self.assertEqual(reply.code_name, "Access-Reject", reply)
         self.assertEqual(self.failure_identifier(reply), identifier)
+
+
+class EapTtlsHandshake(EapTlsTestCase):
+    """EAP-TTLS shares the EAP-TLS handshake, fragmentation and ACK logic."""
+
+    POLICY = EAP_TTLS_POLICY
+
+    def peer(self):
+        return EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+
+    def test_handshake_ends_in_empty_phase2_request(self):
+        """After the final ACK the server starts phase 2 with an empty TTLS request."""
+        peer = self.peer()
+        ack_identifier, phase2_identifier, reply = peer.handshake_phase2()
+        self.assertEqual(peer.sslobj.version(), "TLSv1.2")
+        self.assertIsNotNone(peer.sslobj.getpeercert())
+        self.assertGreater(peer.tls_requests, 0, "no EAP-Request/TTLS carried TLS data")
+
+        self.assertEqual(reply.code_name, "Access-Challenge", reply)
+        eap = radius.eap_from_reply(reply)
+        self.assertEqual(len(eap), 7, eap)
+        self.assertEqual(struct.unpack("!BBH", eap[:4]),
+                         (radius.EAP_REQUEST, phase2_identifier, 7))
+        self.assertEqual(eap[4], radius.EAP_TYPE_TTLS, eap)
+        self.assertEqual(eap[5], 0, eap)
+        self.assertEqual(eap[6], radius.EAP_TTLS_VERSION, eap)
+        self.assertEqual(eap[7:], b"")
+        self.assertNotEqual(phase2_identifier, ack_identifier)
+        self.assertTrue(reply.get(radius.STATE), "phase-2 request without State")
+
+    def test_phase2_response_gets_eap_failure(self):
+        """Task 20 stub: phase-2 AVPs are not parsed yet, so the response fails."""
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                     phase2_identifier, 0))
+        self.assertEqual(reply.code_name, "Access-Reject", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_FAILURE, phase2_identifier, 4))
+
+    def test_ttls13_only_client_is_rejected(self):
+        """The TTLS tunnel uses the same TLS 1.2 pin as EAP-TLS."""
+        peer = EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous",
+                           versions=(ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_3))
+        peer.start()
+        try:
+            peer.sslobj.do_handshake()
+        except ssl.SSLWantReadError:
+            clienthello = peer.outgoing.read()
+        else:
+            raise AssertionError("TLS 1.3-only client handshake completed")
+        self.assertTrue(clienthello, "client sent no ClientHello")
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE, peer.identifier,
+                                                     0, data=clienthello))
+        reply = peer.answer_alert(reply)
+        self.assertEqual(reply.code_name, "Access-Reject", reply)
+        self.assertEqual(radius.eap_from_reply(reply)[0], radius.EAP_FAILURE, reply)
+
+
+class EapTtlsFragmentedServerFlight(EapTlsTestCase):
+    """A TTLS server flight over EAP_MAX_FRAGMENT: TTLS L/M flags and one fragment per ACK."""
+
+    POLICY = EAP_TTLS_POLICY
+
+    @classmethod
+    def server_certificate(cls):
+        long_san = ", ".join("DNS:host%03d.%s.example" % (i, "x" * 60) for i in range(40))
+        return cls.ca.issue("server-big", "/O=tactest/CN=localhost", server=True,
+                            san="IP:127.0.0.1, IP:::1, DNS:localhost, " + long_san)
+
+    def test_ttls_server_flight_is_acked_per_fragment(self):
+        peer = EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+        peer.handshake_phase2()
+        self.assertGreater(peer.fragment_acks, 0, "TTLS server flight was not fragmented")
+        self.assertEqual(peer.sslobj.version(), "TLSv1.2")
+
+
+class EapTtlsFragmentedClientFlight(EapTlsTestCase):
+    """A TTLS client Certificate flight over EAP_MAX_FRAGMENT is reassembled by the server."""
+
+    POLICY = EAP_TTLS_VERIFY_POLICY
+
+    @classmethod
+    def client_certificate(cls):
+        long_san = ", ".join("DNS:host%03d.%s.example" % (i, "x" * 60) for i in range(40))
+        return cls.ca.issue("client-big", "/CN=cert-user", san=long_san)
+
+    def test_ttls_client_fragments_are_acked_and_reassembled(self):
+        peer = EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous",
+                           cert=self.client_cert)
+        peer.handshake_phase2()
+        self.assertGreater(peer.client_fragment_acks, 0, "TTLS client flight was not fragmented")
+        self.assertEqual(peer.sslobj.version(), "TLSv1.2")
 
 
 class EapStart(EapTlsTestCase):
