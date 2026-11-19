@@ -310,8 +310,7 @@ static int eap_parse_hdr(const u_char *eap, size_t eap_len, struct eap_parsed *o
  * tunnel.
  */
 static int eap_ttls_avp_next(const u_char *buf, size_t len, size_t *off,
-			     size_t max_message, struct eap_ttls_avp *avp)
-    __attribute__((unused));
+			     size_t max_message, struct eap_ttls_avp *avp);
 
 static int eap_ttls_avp_next(const u_char *buf, size_t len, size_t *off,
 			     size_t max_message, struct eap_ttls_avp *avp)
@@ -427,8 +426,7 @@ static size_t eap_ttls_avp_encode(u_char *buf, size_t buflen, uint32_t code,
  * AVP is well-formed (unknown optional AVPs are ignored), 0 for a malformed
  * AVP or a sequence over max_message, and -1 for an unknown mandatory AVP.
  */
-static int eap_ttls_avp_validate(const u_char *buf, size_t len, size_t max_message)
-    __attribute__((unused));
+static int eap_ttls_avp_validate(const u_char *buf, size_t len, size_t max_message);
 
 static int eap_ttls_avp_validate(const u_char *buf, size_t len, size_t max_message)
 {
@@ -448,6 +446,112 @@ static int eap_ttls_avp_validate(const u_char *buf, size_t len, size_t max_messa
     if (status == EAP_TTLS_AVP_UNKNOWN_MANDATORY)
 	return -1;
     return 0;
+}
+
+/*
+ * Classify a possibly incomplete phase-2 AVP sequence. Returns 1 when buf
+ * ends on an AVP boundary and every AVP is structurally complete, 0 when the
+ * trailing bytes may be the beginning of an AVP that continues in a later
+ * EAP-TTLS packet, and -1 for a definitely malformed AVP (RADIUS attribute
+ * 26, a length over max_message, or a length below its header size).
+ * *complete_len is the length of the complete prefix.
+ *
+ * The AVP stream inside TLS is byte-oriented: a client may split a TLS record
+ * or an AVP anywhere across EAP-TTLS packets, so truncation at the tail is
+ * not an error until the conversation is abandoned.
+ */
+static int eap_ttls_avp_complete_len(const u_char *buf, size_t len,
+				     size_t max_message, size_t *complete_len)
+{
+    size_t off = 0;
+
+    *complete_len = 0;
+    while (off < len) {
+	size_t remaining = len - off, hdr, length, padded;
+	uint32_t code;
+	u_char flags;
+
+	if (remaining < EAP_TTLS_AVP_HDR_LEN)
+	    return 0;		/* header continues in the next packet */
+
+	memcpy(&code, buf + off, sizeof(code));
+	code = ntohl(code);
+	flags = buf[off + 4];
+	length = ((size_t) buf[off + 5] << 16) |
+		 ((size_t) buf[off + 6] << 8) | (size_t) buf[off + 7];
+
+	if (code == EAP_TTLS_AVP_CODE_RADIUS_VENDOR_SPECIFIC ||
+	    length > max_message)
+	    return -1;
+
+	hdr = EAP_TTLS_AVP_HDR_LEN;
+	if (flags & EAP_TTLS_AVP_FLAG_V)
+	    hdr += EAP_TTLS_AVP_VENDOR_LEN;
+	if (length < hdr)
+	    return -1;
+	if (remaining < hdr || length > remaining)
+	    return 0;		/* AVP (or its Vendor-ID) continues */
+
+	padded = (length + 3) & ~(size_t) 3;
+	if (padded > remaining)
+	    return 0;		/* padding continues */
+
+	off += padded;
+    }
+
+    *complete_len = off;
+    return 1;
+}
+
+/*
+ * Append decrypted phase-2 bytes to the AVP buffer, growing it as needed.
+ * The buffer is bounded by eap_max_message. It carries the cleartext inner
+ * PAP password, so every caller cleanses it before freeing.
+ */
+static int eap_ttls_avp_append(struct eap_session *es, const u_char *data,
+			       size_t len, size_t max)
+{
+    size_t need = es->avp_len + len;
+
+    if (need > max)
+	return 0;
+
+    if (need > es->avp_max) {
+	size_t grow = es->avp_max ? es->avp_max : 1024;
+	u_char *p;
+
+	while (grow < need)
+	    grow <<= 1;
+	if (grow > max)
+	    grow = max;
+
+	p = realloc(es->avp_in, grow);
+	if (!p)
+	    return 0;
+	es->avp_in = p;
+	es->avp_max = grow;
+    }
+
+    if (len)
+	memcpy(es->avp_in + es->avp_len, data, len);
+    es->avp_len = need;
+    return 1;
+}
+
+/*
+ * Cleanse and release the phase-2 AVP buffer. It may hold the cleartext
+ * inner PAP password, so it must never be freed without cleansing.
+ */
+static void eap_ttls_avp_reset(struct eap_session *es)
+{
+    if (!es->avp_in)
+	return;
+
+    OPENSSL_cleanse(es->avp_in, es->avp_max);
+    free(es->avp_in);
+    es->avp_in = NULL;
+    es->avp_len = 0;
+    es->avp_max = 0;
 }
 
 static struct eap_session *eap_lookup(tac_session *session, const u_char *state, size_t state_len);
@@ -1492,12 +1596,227 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 }
 
 /*
+ * Task 22 stub: inner PAP authorization is Task 23. User-Name and
+ * User-Password have been parsed and bounds-checked; this build has no
+ * EAP-TTLS password backend yet, so every PAP request is denied. Neither
+ * argument is logged.
+ */
+static enum token eap_ttls_authorize(tac_session *session, const char *username,
+				     const char *password)
+{
+    (void) username;
+    (void) password;
+    report(session, LOG_WARNING, ~0,
+	   "EAP-TTLS: inner PAP authorization is not implemented in this build");
+    return S_deny;
+}
+
+/*
+ * Fail the phase-2 conversation closed: log a non-sensitive reason, drop the
+ * decrypted AVP buffer (which may contain the cleartext password), and send
+ * EAP-Failure with the client's identifier.
+ */
+static void eap_ttls_phase2_fail(tac_session *session, struct eap_session *es,
+				 u_char identifier, const char *reason)
+{
+    report(session, LOG_WARNING, ~0, "EAP-TTLS: %s", reason);
+    es->flags |= EAP_F_FAILED;
+    eap_ttls_avp_reset(es);
+    eap_send_failure(session, es, identifier);
+}
+
+/*
+ * EAP-TTLS phase 2 (RFC 5281 7.2): the client's EAP-Response/TTLS payload is
+ * TLS application data. Feed it into the established tunnel, read the
+ * decrypted AVP stream, and parse a sequence that may be split across TLS
+ * records and EAP-TTLS packets.
+ *
+ * This cut implements the state machine and PAP value validation only:
+ * User-Name/User-Password are required, and eap_ttls_authorize() is a Task 22
+ * stub that denies every request. Task 23 replaces the stub with the real
+ * authorization path; Task 24 exports keys. Never log AVP data: the
+ * User-Password is cleartext inside TLS.
+ */
+static void eap_ttls_phase2_request(tac_session *session, struct eap_session *es,
+				    const struct eap_parsed *parsed)
+{
+    tac_realm *r = session->ctx->realm;
+    size_t max = (size_t) r->eap_max_message;
+    u_char tmp[4096];
+    int n, err;
+
+    if (!(es->flags & EAP_F_HANDSHAKE_DONE)) {
+	eap_ttls_phase2_fail(session, es, parsed->identifier,
+			     "phase-2 response before the TLS handshake");
+	return;
+    }
+
+    /* An empty response cannot carry AVPs. A fragment with M set is answered
+       with an empty request below. */
+    if (!parsed->data_len && !(parsed->flags & EAP_TTLS_FLAG_M)) {
+	eap_ttls_phase2_fail(session, es, parsed->identifier,
+			     "empty phase-2 response");
+	return;
+    }
+
+    if (parsed->data_len &&
+	BIO_write(es->rbio, parsed->data, (int) parsed->data_len) !=
+	(int) parsed->data_len) {
+	eap_ttls_phase2_fail(session, es, parsed->identifier,
+			     "phase-2 BIO_write failed");
+	return;
+    }
+
+    /*
+     * Drain every complete TLS record. SSL_read() returns SSL_ERROR_WANT_READ
+     * when the current TLS record is split across EAP-TTLS packets; wait for
+     * the next packet then. A clean TLS shutdown (SSL_ERROR_ZERO_RETURN) and
+     * every other TLS error fail closed.
+     */
+    for (;;) {
+	n = SSL_read(es->ssl, tmp, (int) sizeof(tmp));
+	if (n > 0) {
+	    if (!eap_ttls_avp_append(es, tmp, (size_t) n, max)) {
+		OPENSSL_cleanse(tmp, sizeof(tmp));
+		eap_ttls_phase2_fail(session, es, parsed->identifier,
+				     "phase-2 data exceeds max-message");
+		return;
+	    }
+	    continue;
+	}
+	err = SSL_get_error(es->ssl, n);
+	if (err == SSL_ERROR_WANT_READ)
+	    break;
+	OPENSSL_cleanse(tmp, sizeof(tmp));
+	report(session, LOG_WARNING, ~0,
+	       "EAP-TTLS: phase-2 SSL_read failed (%d)", err);
+	eap_ttls_phase2_fail(session, es, parsed->identifier,
+			     "TLS tunnel read error");
+	return;
+    }
+    OPENSSL_cleanse(tmp, sizeof(tmp));
+
+    /* RFC 5281 3.2: a fragment with M set is acknowledged with an empty
+       EAP-Request/TTLS before the next fragment. Do not parse a partial
+       message. */
+    if (parsed->flags & EAP_TTLS_FLAG_M) {
+	eap_send_request(session, es, EAP_TYPE_TTLS, 0, NULL, 0, 1);
+	return;
+    }
+
+    if (!es->avp_len) {
+	/* The TLS record carried no application data yet (for example, only
+	   part of a record). Prompt for the next client EAP packet. */
+	eap_send_request(session, es, EAP_TYPE_TTLS, 0, NULL, 0, 1);
+	return;
+    }
+
+    {
+	size_t complete_len = 0;
+	int complete = eap_ttls_avp_complete_len(es->avp_in, es->avp_len, max,
+						 &complete_len);
+
+	if (complete < 0) {
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "malformed phase-2 AVP");
+	    return;
+	}
+	if (!complete) {
+	    /* The trailing AVP continues in a later EAP-TTLS packet. */
+	    eap_send_request(session, es, EAP_TYPE_TTLS, 0, NULL, 0, 1);
+	    return;
+	}
+	if (eap_ttls_avp_validate(es->avp_in, es->avp_len, max) != 1) {
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "invalid phase-2 AVP sequence");
+	    return;
+	}
+    }
+
+    {
+	struct eap_ttls_avp avp;
+	const u_char *user_name = NULL, *user_password = NULL;
+	size_t user_name_len = 0, user_password_len = 0, off = 0;
+	int have_user_name = 0, have_user_password = 0;
+	char password[EAP_TTLS_MAX_USER_PASSWORD + 1];
+	enum token res;
+
+	while (eap_ttls_avp_next(es->avp_in, es->avp_len, &off, max, &avp) ==
+	       EAP_TTLS_AVP_OK) {
+	    if (avp.code == EAP_TTLS_AVP_USER_NAME && !have_user_name) {
+		user_name = avp.data;
+		user_name_len = avp.data_len;
+		have_user_name = 1;
+	    } else if (avp.code == EAP_TTLS_AVP_USER_PASSWORD && !have_user_password) {
+		user_password = avp.data;
+		user_password_len = avp.data_len;
+		have_user_password = 1;
+	    }
+	}
+
+	if (!have_user_name || !have_user_password) {
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "PAP requires User-Name and User-Password AVPs");
+	    return;
+	}
+	if (!user_name_len || user_name_len > EAP_TTLS_MAX_USER_NAME ||
+	    memchr(user_name, 0, user_name_len)) {
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "invalid inner User-Name");
+	    return;
+	}
+
+	/* RFC 5281 7.3 / RFC 2865: the cleartext password may be null-padded
+	   to a multiple of 16. Strip trailing NULs, reject embedded NULs and
+	   bound the value before copying it into a C string. */
+	while (user_password_len && user_password[user_password_len - 1] == 0)
+	    user_password_len--;
+	if (!user_password_len || user_password_len > EAP_TTLS_MAX_USER_PASSWORD ||
+	    memchr(user_password, 0, user_password_len)) {
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "invalid inner User-Password");
+	    return;
+	}
+
+	memcpy(password, user_password, user_password_len);
+	password[user_password_len] = 0;
+
+	/* RFC 5281 7.3: the inner User-Name is authoritative; the outer
+	   EAP-Response/Identity (typically "anonymous") is not used. */
+	str_set(&session->username,
+		mem_strndup(session->mem, (u_char *) user_name, user_name_len),
+		user_name_len);
+	if (!session->username.txt) {
+	    OPENSSL_cleanse(password, sizeof(password));
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "out of memory storing inner User-Name");
+	    return;
+	}
+
+	res = eap_ttls_authorize(session, session->username.txt, password);
+	OPENSSL_cleanse(password, sizeof(password));
+	if (res != S_permit) {
+	    es->flags |= EAP_F_FAILED;
+	    eap_ttls_avp_reset(es);
+	    eap_send_failure(session, es, parsed->identifier);
+	    return;
+	}
+    }
+
+    /* Task 22 must not report success for a parsed AVP sequence: the real
+       authorization path is Task 23 and key export is Task 24. */
+    es->flags |= EAP_F_FAILED;
+    eap_ttls_avp_reset(es);
+    eap_send_failure(session, es, parsed->identifier);
+}
+
+/*
  * EAP-Response/EAP-TTLS. The packet layer accepts TTLSv0 only: a response
  * with another version fails the conversation. The S bit is already
  * rejected by eap_parse_hdr() for responses. Phase 1 (the TLS handshake) is
  * handled by the shared EAP-TLS tunnel code. Phase 2 starts with the empty
- * EAP-Request/TTLS sent by eap_tls_ack(); Task 20 answers any phase-2
- * response with EAP-Failure because the AVP layer and inner PAP are Task 22.
+ * EAP-Request/TTLS sent by eap_tls_ack(); eap_ttls_phase2_request() reads the
+ * decrypted AVPs and runs the Task 22 PAP state machine.
  */
 static void eap_ttls_request(tac_session *session, struct eap_session *es,
 			     const struct eap_parsed *parsed)
@@ -1517,11 +1836,7 @@ static void eap_ttls_request(tac_session *session, struct eap_session *es,
     }
 
     if (es->ttls_phase == EAP_TTLS_PHASE2) {
-	/* Task 20 stub: no AVP parsing yet. Task 22 replaces this with the
-	   inner PAP conversation. */
-	report(session, LOG_WARNING, ~0,
-	       "EAP-TTLS: phase-2 inner authentication is not implemented in this build");
-	eap_send_failure(session, es, parsed->identifier);
+	eap_ttls_phase2_request(session, es, parsed);
 	return;
     }
 
@@ -1775,6 +2090,10 @@ void eap_session_free(void *payload)
 	SSL_free(e->ssl);	/* frees rbio/wbio */
     free(e->in);
     free(e->tls_in);
+    if (e->avp_in) {
+	OPENSSL_cleanse(e->avp_in, e->avp_max);
+	free(e->avp_in);
+    }
     while (e->out) {
 	struct eap_fragment *f = e->out;
 	e->out = f->next;

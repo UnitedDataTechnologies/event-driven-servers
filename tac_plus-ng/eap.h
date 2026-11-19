@@ -96,6 +96,10 @@
 #define EAP_TTLS_AVP_VENDOR_LEN    4	/* Vendor-ID when V is set */
 #define EAP_TTLS_AVP_CODE_RADIUS_VENDOR_SPECIFIC 26
 
+/* Inner PAP bounds: the RADIUS User-Name/User-Password value limits. */
+#define EAP_TTLS_MAX_USER_NAME     255
+#define EAP_TTLS_MAX_USER_PASSWORD 128
+
 struct eap_ttls_avp {
     uint32_t code;		/* host byte order */
     u_char flags;		/* V/M, reserved bits cleared */
@@ -197,6 +201,10 @@ struct eap_session {
     size_t tls_len;
     size_t tls_max;
     size_t tls_total;		/* announced total, if L was set */
+
+    u_char *avp_in;		/* EAP-TTLS phase-2 decrypted AVP buffer */
+    size_t avp_len;
+    size_t avp_max;
 
     struct eap_fragment *out;	/* pending EAP-TLS fragments */
     size_t out_offset;		/* offset of the next fragment */
