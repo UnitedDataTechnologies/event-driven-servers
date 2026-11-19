@@ -1437,6 +1437,7 @@ class EapTtlsPeer(EapTlsPeer):
             if flags or version != radius.EAP_TTLS_VERSION or data:
                 raise AssertionError("bad phase-2 request: flags %#x, version %d, %d data bytes"
                                      % (flags, version, len(data)))
+            self.identifier = identifier
             return ack_identifier, identifier, reply
         raise AssertionError("TLS handshake did not complete in %d rounds" % max_rounds)
 
@@ -1448,6 +1449,61 @@ class EapTtlsPeer(EapTlsPeer):
         if not data or data[0] != 21:
             raise AssertionError("expected a TLS alert, got %r" % data[:8])
         return self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE, identifier, 0))
+
+    def phase2_write(self, data):
+        """Write application data through the TLS tunnel as EAP-Response/TTLS.
+
+        ssl.SSLObject.write() emits one or more TLS records into the outgoing
+        memory BIO; those ciphertext bytes are the EAP-TTLS phase-2 payload.
+        """
+        written = self.sslobj.write(data)
+        if written != len(data):
+            raise AssertionError("SSLObject wrote %d of %d bytes" % (written, len(data)))
+        out = self.outgoing.read()
+        if not out:
+            raise AssertionError("SSLObject produced no TLS record for %d bytes" % len(data))
+        return self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                    self.identifier, 0, data=out))
+
+    def phase2_write_split(self, data, split):
+        """Send one TLS record split across two EAP-Response/TTLS packets."""
+        written = self.sslobj.write(data)
+        if written != len(data):
+            raise AssertionError("SSLObject wrote %d of %d bytes" % (written, len(data)))
+        out = self.outgoing.read()
+        if split <= 0 or split >= len(out):
+            raise AssertionError("split %d outside a %d-byte TLS record" % (split, len(out)))
+        first = self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                     self.identifier, 0, data=out[:split]))
+        self.expect_phase2_prompt(first)
+        return self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                    self.identifier, 0, data=out[split:]))
+
+    def expect_phase2_prompt(self, reply):
+        """Expect the server's empty EAP-Request/TTLS and adopt its identifier."""
+        if reply.code_name != "Access-Challenge":
+            raise AssertionError("expected a phase-2 prompt, got %s: %r"
+                                 % (reply.code_name, radius.eap_from_reply(reply)))
+        identifier, flags, version, data, _ = self.parse_ttls_request(
+            radius.eap_from_reply(reply))
+        if flags or version != radius.EAP_TTLS_VERSION or data:
+            raise AssertionError("bad phase-2 prompt: flags %#x, version %d, %d data bytes"
+                                 % (flags, version, len(data)))
+        self.identifier = identifier
+        return identifier
+
+    def phase2_failure(self, reply):
+        """Assert an Access-Reject carrying a 4-byte EAP-Failure; return its identifier."""
+        if reply.code_name != "Access-Reject":
+            raise AssertionError("expected Access-Reject, got %s: %r"
+                                 % (reply.code_name, radius.eap_from_reply(reply)))
+        eap = radius.eap_from_reply(reply)
+        if len(eap) != 4:
+            raise AssertionError("EAP-Failure must be 4 bytes, got %r" % eap)
+        code, identifier, length = struct.unpack("!BBH", eap)
+        if code != radius.EAP_FAILURE or length != 4:
+            raise AssertionError("expected EAP-Failure, got %r" % eap)
+        return identifier
 
 
 @unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
@@ -1748,6 +1804,139 @@ class EapTtlsHandshake(EapTlsTestCase):
         reply = peer.answer_alert(reply)
         self.assertEqual(reply.code_name, "Access-Reject", reply)
         self.assertEqual(radius.eap_from_reply(reply)[0], radius.EAP_FAILURE, reply)
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsPhase2(EapTlsTestCase):
+    """EAP-TTLS phase 2: decrypted AVPs, PAP validation and the Task 22 stub.
+
+    The TLS handshake is shared with EAP-TLS; phase 2 carries PAP AVPs as TLS
+    application data. Task 22 parses User-Name/User-Password and calls an
+    authorization stub that denies every request, so valid AVPs end in
+    Access-Reject/EAP-Failure, not EAP-Success.
+    """
+
+    POLICY = EAP_TTLS_POLICY
+
+    def peer(self):
+        return EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+
+    @staticmethod
+    def pap_avps(user_name=b"alice", password=b"secret"):
+        return radius.eap_ttls_avps(radius.eap_ttls_avp(radius.AVP_USER_NAME, user_name),
+                                    radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, password))
+
+    def test_valid_pap_avps_get_failure(self):
+        """Valid inner User-Name/User-Password reach the Task 22 deny stub."""
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(self.pap_avps())
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_malformed_avp_gets_failure(self):
+        """An AVP length below its 8-byte header is malformed, not incomplete."""
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + (4).to_bytes(3, "big")
+        reply = peer.phase2_write(raw)
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_truncated_avp_waits_then_empty_response_fails(self):
+        """A truncated AVP may continue; an empty response then fails closed."""
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + \
+            (100).to_bytes(3, "big") + b"x"
+        reply = peer.phase2_write(raw)
+        prompt_identifier = peer.expect_phase2_prompt(reply)
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                     prompt_identifier, 0))
+        self.assertEqual(peer.phase2_failure(reply), prompt_identifier)
+
+    def test_missing_user_password_gets_failure(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(radius.eap_ttls_avp(radius.AVP_USER_NAME, b"alice"))
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_empty_user_name_gets_failure(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(self.pap_avps(user_name=b""))
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_empty_user_password_gets_failure(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(self.pap_avps(password=b""))
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_oversized_user_password_gets_failure(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(self.pap_avps(password=b"x" * 129))
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_unknown_mandatory_avp_gets_failure(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        unknown = radius.eap_ttls_avp(99, b"x", flags=radius.AVP_FLAG_M)
+        reply = peer.phase2_write(radius.eap_ttls_avps(unknown, self.pap_avps()))
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_unknown_optional_avp_is_ignored(self):
+        """Unknown M=0 AVPs are skipped; the trailing AVP may still be split."""
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        avps = self.pap_avps()
+        unknown = radius.eap_ttls_avp(99, b"x")
+        reply = peer.phase2_write(unknown + avps[:4])
+        prompt_identifier = peer.expect_phase2_prompt(reply)
+        reply = peer.phase2_write(avps[4:])
+        self.assertEqual(peer.phase2_failure(reply), prompt_identifier)
+
+    def test_radius_attribute_26_gets_failure(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        raw = struct.pack("!I", 26) + b"\x00" + (12).to_bytes(3, "big") + b"x" + bytes(3)
+        reply = peer.phase2_write(raw)
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_avps_split_across_tls_records(self):
+        """Two TLS records, one EAP-TTLS packet each: the server waits for the rest."""
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        avps = self.pap_avps()
+        split = 10      # inside the User-Name AVP
+        reply = peer.phase2_write(avps[:split])
+        prompt_identifier = peer.expect_phase2_prompt(reply)
+        reply = peer.phase2_write(avps[split:])
+        self.assertEqual(peer.phase2_failure(reply), prompt_identifier)
+
+    def test_tls_record_split_across_packets(self):
+        """One TLS record split over two EAP-TTLS packets: wait, then fail."""
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write_split(self.pap_avps(), split=7)
+        self.assertEqual(peer.phase2_failure(reply), peer.identifier)
+
+    def test_empty_phase2_response_gets_failure(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                     phase2_identifier, 0))
+        self.assertEqual(peer.phase2_failure(reply), phase2_identifier)
+
+    def test_valid_avps_with_incomplete_trailer_wait(self):
+        """Complete PAP AVPs plus a trailing partial AVP: wait, then fail."""
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        partial = radius.eap_ttls_avp(99, b"xy")[:4]    # only the AVP code
+        reply = peer.phase2_write(self.pap_avps() + partial)
+        prompt_identifier = peer.expect_phase2_prompt(reply)
+        reply = peer.phase2_write(radius.eap_ttls_avp(99, b"xy")[4:])
+        self.assertEqual(peer.phase2_failure(reply), prompt_identifier)
 
 
 class EapTtlsFragmentedServerFlight(EapTlsTestCase):
