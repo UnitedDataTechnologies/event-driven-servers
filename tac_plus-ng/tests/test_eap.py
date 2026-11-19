@@ -868,8 +868,9 @@ EAP_TTLS_VERIFY_POLICY = eap_policy(method="ttls", inner_method="pap",
                                     identity_source="inner-identity", verify_client="yes",
                                     users=EAP_TTLS_USERS)
 
-# Inner PAP users with local passwords. Kept separate from EAP_TTLS_USERS so
-# the Task 22 tests (which expect the deny stub) keep failing as intended.
+# Inner PAP users with local passwords. Kept separate from EAP_TTLS_USERS:
+# EapTtlsPhase2 uses a policy without PAP passwords and expects a denial,
+# while EapTtlsPap exercises successful local PAP.
 EAP_TTLS_PAP_USERS = """
 \tprofile eap-deny {
 \t\tscript { deny }
@@ -906,6 +907,63 @@ EAP_TTLS_PAP_USERS = """
 EAP_TTLS_PAP_POLICY = eap_policy(method="ttls", inner_method="pap",
                                  identity_source="inner-identity", verify_client="no",
                                  users=EAP_TTLS_PAP_USERS)
+
+# verify-client = yes plus inner PAP users, for a successful certificate +
+# inner-password exchange.
+EAP_TTLS_VERIFY_PAP_POLICY = eap_policy(method="ttls", inner_method="pap",
+                                        identity_source="inner-identity", verify_client="yes",
+                                        users=EAP_TTLS_PAP_USERS)
+
+
+def eap_ttls_transport_policy(users=EAP_TTLS_PAP_USERS):
+    """EAP-TTLS/PAP over RADIUS/TLS: a TLS listener plus the TTLS realm credentials.
+
+    The six %s placeholders are the TLS listener certificate/key/CA and the
+    EAP TTLS certificate/key/CA; EapTlsTestCase formats them from its CA.
+    """
+    return """
+\tinclude = "%s"
+\ttls cert-file = %%s
+\ttls key-file = %%s
+\ttls ca-file = %%s
+\teap {
+\t\teap-method = ttls
+\t\teap-inner-method = pap
+\t\tcert-file = %%s
+\t\tkey-file = %%s
+\t\tca-file = %%s
+\t\tverify-client = no
+\t\teap-identity-source = inner-identity
+\t}
+\tdevice radius-nas {
+\t\taddress = 127.0.0.6
+\t\tkey = tactest
+\t\tradius.key = radsecret
+\t}
+\tprofile eap-profile {
+\t\tscript {
+\t\t\tset radius[Cisco:Cisco-AVPair] = "shell:priv-lvl=15"
+\t\t\tpermit
+\t\t}
+\t}
+%s""" % (DICTIONARY, users)
+
+
+EAP_TTLS_TRANSPORT_POLICY = eap_ttls_transport_policy()
+
+# TTLS/PAP variants for timeout, max-message, and max-sessions limits.
+EAP_TTLS_SHORT_TIMEOUT_POLICY = eap_policy(method="ttls", inner_method="pap",
+                                           identity_source="inner-identity", verify_client="no",
+                                           users=EAP_TTLS_PAP_USERS,
+                                           extra="\t\ttimeout = 1\n")
+EAP_TTLS_SMALL_MAX_MESSAGE_POLICY = eap_policy(method="ttls", inner_method="pap",
+                                               identity_source="inner-identity", verify_client="no",
+                                               users=EAP_TTLS_PAP_USERS,
+                                               extra="\t\tmax-message = 256\n")
+EAP_TTLS_SMALL_MAX_SESSIONS_POLICY = eap_policy(method="ttls", inner_method="pap",
+                                                identity_source="inner-identity", verify_client="no",
+                                                users=EAP_TTLS_PAP_USERS,
+                                                extra="\t\tmax-sessions = 2\n")
 
 # A second NAS in the same realm: EAP State must not be replayable from it.
 OTHER_NAS_DEVICE = """
@@ -1344,8 +1402,8 @@ class EapTtlsPeer(EapTlsPeer):
     Version byte (RFC 5281 3.1). Server fragments are reassembled; each
     fragment with M set is ACKed with an empty EAP-Response/EAP-TTLS. After
     the TLS handshake the server starts phase 2 with an empty
-    EAP-Request/EAP-TTLS (no AVPs, Version 0). Task 20 does not parse inner
-    AVPs yet, so any phase-2 response is answered with EAP-Failure.
+    EAP-Request/EAP-TTLS (no AVPs, Version 0); phase2_write() sends the
+    tunneled AVPs.
     """
 
     def parse_ttls_request(self, eap):
@@ -1521,6 +1579,18 @@ class EapTtlsPeer(EapTlsPeer):
                                                     data=out,
                                                     total=len(out) if total is None else total))
 
+    def phase2_write_flags(self, data, flags, total=None):
+        """Write application data with explicit TTLS flags (for fragment tests)."""
+        written = self.sslobj.write(data)
+        if written != len(data):
+            raise AssertionError("SSLObject wrote %d of %d bytes" % (written, len(data)))
+        out = self.outgoing.read()
+        if not out:
+            raise AssertionError("SSLObject produced no TLS record for %d bytes" % len(data))
+        return self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                    self.identifier, flags,
+                                                    data=out, total=total))
+
     def phase2_write_split(self, data, split):
         """Send one TLS record split across two EAP-Response/TTLS packets."""
         written = self.sslobj.write(data)
@@ -1685,9 +1755,8 @@ class EapIdentity(EapTlsTestCase):
 class EapTtlsStart(EapTlsTestCase):
     """EAP-TTLS/PAP: Identity -> EAP-Request/TTLS Start with Version 0.
 
-    Task 19 implements the packet layer only: the TLS tunnel, AVPs, inner
-    PAP and phase 2 are not implemented yet, so a TTLS response after Start
-    ends in EAP-Failure.
+    This class pins the Start packet and the packet-layer failures; the TLS
+    tunnel, phase 2, and inner PAP are covered by the classes below.
     """
 
     POLICY = EAP_TTLS_POLICY
@@ -1834,7 +1903,7 @@ class EapTtlsHandshake(EapTlsTestCase):
         self.assertTrue(reply.get(radius.STATE), "phase-2 request without State")
 
     def test_phase2_response_gets_eap_failure(self):
-        """Task 20 stub: phase-2 AVPs are not parsed yet, so the response fails."""
+        """An empty phase-2 response is invalid and fails closed."""
         peer = self.peer()
         _, phase2_identifier, _ = peer.handshake_phase2()
         reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
@@ -1865,12 +1934,11 @@ class EapTtlsHandshake(EapTlsTestCase):
 @unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
 @unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
 class EapTtlsPhase2(EapTlsTestCase):
-    """EAP-TTLS phase 2: decrypted AVPs, PAP validation and the Task 22 stub.
+    """EAP-TTLS phase 2: decrypted AVPs and PAP validation.
 
     The TLS handshake is shared with EAP-TLS; phase 2 carries PAP AVPs as TLS
-    application data. Task 22 parses User-Name/User-Password and calls an
-    authorization stub that denies every request, so valid AVPs end in
-    Access-Reject/EAP-Failure, not EAP-Success.
+    application data. This policy has no PAP password for the inner user, so
+    valid AVPs fail closed; EapTtlsPap covers successful local PAP.
     """
 
     POLICY = EAP_TTLS_POLICY
@@ -1884,7 +1952,7 @@ class EapTtlsPhase2(EapTlsTestCase):
                                     radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, password))
 
     def test_valid_pap_avps_get_failure(self):
-        """Valid inner User-Name/User-Password reach the Task 22 deny stub."""
+        """Valid inner User-Name/User-Password reach authorization and fail closed."""
         peer = self.peer()
         _, phase2_identifier, _ = peer.handshake_phase2()
         reply = peer.phase2_write(self.pap_avps())
@@ -2263,6 +2331,415 @@ class EapTtlsFragmentedClientFlight(EapTlsTestCase):
         peer.handshake_phase2()
         self.assertGreater(peer.client_fragment_acks, 0, "TTLS client flight was not fragmented")
         self.assertEqual(peer.sslobj.version(), "TLSv1.2")
+
+
+def ttls_pap_avps(user_name=b"pap-user", password=b"papsecret"):
+    """Inner PAP User-Name/User-Password AVPs."""
+    return radius.eap_ttls_avps(radius.eap_ttls_avp(radius.AVP_USER_NAME, user_name),
+                                radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, password))
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsAvpHardening(EapTlsTestCase):
+    """Malformed and boundary AVP sequences fail closed in phase 2."""
+
+    POLICY = EAP_TTLS_PAP_POLICY
+
+    def peer(self):
+        return EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+
+    def phase2(self):
+        peer = self.peer()
+        _, identifier, _ = peer.handshake_phase2()
+        return peer, identifier
+
+    def fail_after_prompt(self, peer, raw):
+        """A partial AVP waits for more; an empty response then fails closed."""
+        reply = peer.phase2_write(raw)
+        prompt = peer.expect_phase2_prompt(reply)
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE, prompt, 0))
+        self.assertEqual(peer.phase2_failure(reply), prompt)
+
+    def test_truncated_avp_header_waits_then_empty_response_fails(self):
+        peer, _ = self.phase2()
+        self.fail_after_prompt(peer, struct.pack("!I", radius.AVP_USER_NAME))
+
+    def test_avp_length_over_buffer_waits_then_empty_response_fails(self):
+        peer, _ = self.phase2()
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + \
+            (100).to_bytes(3, "big") + b"x"
+        self.fail_after_prompt(peer, raw)
+
+    def test_impossible_padding_waits_then_empty_response_fails(self):
+        """Length 9 needs three padding bytes, but the record ends after nine."""
+        peer, _ = self.phase2()
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + \
+            (9).to_bytes(3, "big") + b"x"
+        self.fail_after_prompt(peer, raw)
+
+    def test_unknown_mandatory_avp_only_fails(self):
+        peer, identifier = self.phase2()
+        raw = radius.eap_ttls_avp(99, b"x", flags=radius.AVP_FLAG_M)
+        reply = peer.phase2_write(raw)
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+
+    def test_unknown_optional_avp_only_fails_missing_pap(self):
+        peer, identifier = self.phase2()
+        reply = peer.phase2_write(radius.eap_ttls_avp(99, b"x"))
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+
+    def test_user_name_with_embedded_nul_is_rejected(self):
+        peer, identifier = self.phase2()
+        reply = peer.phase2_write(ttls_pap_avps(user_name=b"pap\x00user"))
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+
+    def test_user_password_with_embedded_nul_is_rejected(self):
+        peer, identifier = self.phase2()
+        reply = peer.phase2_write(ttls_pap_avps(password=b"pap\x00secret"))
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+
+    def test_overlong_user_name_is_rejected(self):
+        peer, identifier = self.phase2()
+        reply = peer.phase2_write(ttls_pap_avps(user_name=b"x" * 256))
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+
+    def test_reversed_avp_order_is_accepted(self):
+        """PAP does not depend on the order of User-Name and User-Password."""
+        peer, identifier = self.phase2()
+        raw = radius.eap_ttls_avps(radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, b"papsecret"),
+                                   radius.eap_ttls_avp(radius.AVP_USER_NAME, b"pap-user"))
+        reply = peer.phase2_write(raw)
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_SUCCESS, identifier, 4))
+
+    def test_phase2_l_flag_zero_total_is_rejected(self):
+        peer, identifier = self.phase2()
+        reply = peer.phase2_write_l(ttls_pap_avps(), total=0)
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsOversized(EapTlsTestCase):
+    """max-message bounds the EAP packet, the TLS handshake reassembly and AVPs."""
+
+    POLICY = EAP_TTLS_SMALL_MAX_MESSAGE_POLICY
+
+    def peer(self):
+        return EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+
+    def test_oversized_eap_message_is_rejected(self):
+        c = self.radius("radsecret")
+        eap = radius.eap_packet(radius.EAP_RESPONSE, 1, radius.EAP_TYPE_IDENTITY, b"x" * 300)
+        req = radius.Packet(radius.ACCESS_REQUEST, attributes=[
+            (radius.USER_NAME, b"anonymous")] + radius.eap_attributes(eap))
+        r = c.exchange(req, message_authenticator=True)
+        self.assertEqual(r.code_name, "Access-Reject", r)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(r)),
+                         (radius.EAP_FAILURE, 1, 4))
+
+    def test_avp_length_over_max_message_fails_immediately(self):
+        peer = self.peer()
+        _, identifier, _ = peer.handshake_phase2()
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + \
+            (300).to_bytes(3, "big")
+        reply = peer.phase2_write(raw)
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+
+    def test_avp_stream_over_max_message_fails(self):
+        """A complete TLS record can push the accumulated AVP stream over the cap."""
+        peer = self.peer()
+        _, _, _ = peer.handshake_phase2()
+        # Declared length 256 (the cap) plus four extra bytes: the stream is
+        # still incomplete at 240 bytes and the last 20-byte record pushes it
+        # to 260, which exceeds max-message.
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + \
+            (256).to_bytes(3, "big") + b"x" * 248 + b"\x00\x00\x00\x01"
+        for off in range(0, 240, 20):
+            reply = peer.phase2_write(raw[off:off + 20])
+            peer.expect_phase2_prompt(reply)
+        reply = peer.phase2_write(raw[240:260])
+        self.assertEqual(peer.phase2_failure(reply), peer.identifier)
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsRetransmission(EapTlsTestCase):
+    """Retransmitted TTLS fragments and requests replay the cached reply."""
+
+    POLICY = EAP_TTLS_PAP_POLICY
+
+    def peer(self):
+        return EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+
+    def phase2(self, user_name=b"pap-user", password=b"papsecret"):
+        peer = self.peer()
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(ttls_pap_avps(user_name, password))
+        return peer, identifier, reply
+
+    def assert_cached(self, c, request, reply, expected_code):
+        self.assertIsNotNone(request)
+        resent = c.exchange(request, message_authenticator=True)
+        self.assertEqual(resent.code_name, expected_code, resent)
+        self.assertEqual(radius.eap_from_reply(resent), radius.eap_from_reply(reply))
+        self.assertEqual(resent.get(radius.STATE), reply.get(radius.STATE))
+        return resent
+
+    def test_retransmitted_client_fragment_gets_cached_reply(self):
+        c = self.radius("radsecret")
+        peer = EapTtlsPeer(c, self.ca, "anonymous")
+        peer.start()
+        try:
+            peer.sslobj.do_handshake()
+        except ssl.SSLWantReadError:
+            clienthello = peer.outgoing.read()
+        else:
+            raise AssertionError("client handshake finished before the server flight")
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                     peer.identifier, 0,
+                                                     data=clienthello))
+        self.assertEqual(reply.code_name, "Access-Challenge", reply)
+        resent = self.assert_cached(c, peer.last_request, reply, "Access-Challenge")
+        self.assertFalse(radius.eap_from_reply(resent)[5] & radius.EAP_TTLS_S,
+                         "retransmission produced a fresh EAP-TTLS Start")
+
+    def test_retransmitted_final_ack_gets_cached_phase2_prompt(self):
+        peer = self.peer()
+        ack_identifier, _, reply = peer.handshake_phase2()
+        resent = self.assert_cached(peer.client, peer.last_request, reply, "Access-Challenge")
+        eap = radius.eap_from_reply(resent)
+        self.assertEqual(eap[4], radius.EAP_TYPE_TTLS, eap)
+        self.assertEqual(eap[5], 0, eap)
+        self.assertEqual(eap[6], radius.EAP_TTLS_VERSION, eap)
+        self.assertEqual(eap[7:], b"")
+        self.assertNotEqual(eap[1], ack_identifier)
+
+    def test_retransmitted_phase2_fragment_ack_gets_cached_reply(self):
+        peer = self.peer()
+        _, _, _ = peer.handshake_phase2()
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + \
+            (64).to_bytes(3, "big") + b"x" * 8
+        reply = peer.phase2_write_flags(raw, radius.EAP_TTLS_M)
+        peer.expect_phase2_prompt(reply)
+        self.assert_cached(peer.client, peer.last_request, reply, "Access-Challenge")
+
+    def test_retransmitted_phase2_failure_gets_cached_reject(self):
+        peer, identifier, reply = self.phase2(password=b"wrong")
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+        self.assert_cached(peer.client, peer.last_request, reply, "Access-Reject")
+
+    def test_retransmitted_phase2_success_gets_cached_accept(self):
+        peer, identifier, reply = self.phase2()
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        resent = self.assert_cached(peer.client, peer.last_request, reply, "Access-Accept")
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(resent)),
+                         (radius.EAP_SUCCESS, identifier, 4))
+        self.assertEqual(cisco_avpairs(resent), [b"shell:priv-lvl=15"])
+        self.assertEqual(len(mppe_vsa_values(resent, MS_MPPE_RECV_KEY)), 1)
+        self.assertEqual(len(mppe_vsa_values(resent, MS_MPPE_SEND_KEY)), 1)
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsTls11Only(EapTlsTestCase):
+    """The TTLS tunnel pins TLS 1.2: a TLS 1.0/1.1-only client is rejected."""
+
+    POLICY = EAP_TTLS_PAP_POLICY
+
+    def test_tls11_only_client_is_rejected(self):
+        peer = EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+        peer.start()
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                     peer.identifier, 0,
+                                                     data=tls11_client_hello()))
+        reply = peer.answer_alert(reply)
+        self.assertEqual(reply.code_name, "Access-Reject", reply)
+        self.assertEqual(radius.eap_from_reply(reply)[0], radius.EAP_FAILURE, reply)
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsVerifyClient(EapTlsTestCase):
+    """verify-client = yes requires a client certificate but still uses inner PAP."""
+
+    POLICY = EAP_TTLS_VERIFY_PAP_POLICY
+
+    def test_missing_client_certificate_gets_alert_then_failure(self):
+        peer = EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous", cert=None)
+        identifier, alert = peer.handshake_until_alert()
+        self.assertEqual(alert[0], 21, "expected a TLS alert record, got %r" % alert)
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE, identifier, 0))
+        self.assertEqual(reply.code_name, "Access-Reject", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_FAILURE, identifier, 4))
+
+    def test_client_certificate_and_inner_pap_are_accepted(self):
+        peer = EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous",
+                           cert=self.client_cert)
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(ttls_pap_avps())
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_SUCCESS, identifier, 4))
+        self.assertEqual(cisco_avpairs(reply), [b"shell:priv-lvl=15"])
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsExpiredState(EapTlsTestCase):
+    """An expired TTLS State is rejected; the periodic handler purges it (timeout = 1)."""
+
+    POLICY = EAP_TTLS_SHORT_TIMEOUT_POLICY
+
+    def test_expired_state_is_rejected(self):
+        c = self.radius("radsecret")
+        eap = radius.eap_packet(radius.EAP_RESPONSE, 1, radius.EAP_TYPE_IDENTITY, b"anonymous")
+        req = radius.Packet(radius.ACCESS_REQUEST, attributes=[
+            (radius.USER_NAME, b"anonymous")] + radius.eap_attributes(eap))
+        r = c.exchange(req, message_authenticator=True)
+        self.assertEqual(r.code_name, "Access-Challenge", r)
+        reply_eap = radius.eap_from_reply(r)
+        self.assertEqual(reply_eap[4], radius.EAP_TYPE_TTLS, reply_eap)
+        identifier = reply_eap[1]
+        state = (r.get(radius.STATE) or [None])[0]
+        self.assertTrue(state, "Access-Challenge without State")
+
+        time.sleep(3.0)     # timeout = 1, the periodic handler runs every 2 s
+
+        ttls = radius.eap_ttls_packet(radius.EAP_RESPONSE, identifier, 0)
+        reply = c.exchange(access_request(ttls, state, user="anonymous"),
+                           message_authenticator=True)
+        self.assertEqual(reply.code_name, "Access-Reject", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_FAILURE, identifier, 4))
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsSessionCap(EapTlsTestCase):
+    """max-sessions = 2: an active session is never evicted for a new one."""
+
+    POLICY = EAP_TTLS_SMALL_MAX_SESSIONS_POLICY
+
+    def identity(self, c):
+        eap = radius.eap_packet(radius.EAP_RESPONSE, 1, radius.EAP_TYPE_IDENTITY, b"anonymous")
+        req = radius.Packet(radius.ACCESS_REQUEST, attributes=[
+            (radius.USER_NAME, b"anonymous")] + radius.eap_attributes(eap))
+        r = c.exchange(req, message_authenticator=True)
+        self.assertEqual(r.code_name, "Access-Challenge", r)
+        reply_eap = radius.eap_from_reply(r)
+        self.assertEqual(reply_eap[4], radius.EAP_TYPE_TTLS, reply_eap)
+        self.assertEqual(reply_eap[5], radius.EAP_TTLS_S, reply_eap)
+        return reply_eap[1], (r.get(radius.STATE) or [None])[0]
+
+    def nak(self, c, identifier, state):
+        eap = radius.eap_packet(radius.EAP_RESPONSE, identifier, radius.EAP_TYPE_NAK,
+                                bytes([radius.EAP_TYPE_TTLS]))
+        return c.exchange(access_request(eap, state, user="anonymous"),
+                          message_authenticator=True)
+
+    def test_active_sessions_are_not_evicted_at_cap(self):
+        """RFC 5080 2.2.2: a retransmitted initial request must not evict a
+        running conversation. With both slots active, the third initial
+        request fails closed and both original sessions keep working."""
+        c = self.radius("radsecret")
+        ident1, state1 = self.identity(c)
+        ident2, state2 = self.identity(c)
+        self.assertTrue(state1 and state2)
+        self.assertNotEqual(state1, state2)
+
+        # A third no-State Identity is a new initial request at the cap.
+        eap = radius.eap_packet(radius.EAP_RESPONSE, 1, radius.EAP_TYPE_IDENTITY, b"anonymous")
+        req = radius.Packet(radius.ACCESS_REQUEST, attributes=[
+            (radius.USER_NAME, b"anonymous")] + radius.eap_attributes(eap))
+        reply = c.exchange(req, message_authenticator=True)
+        self.assertEqual(reply.code_name, "Access-Reject", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_FAILURE, 1, 4))
+
+        # Neither active session was evicted: both answer a Nak with TTLS Start.
+        for identifier, state in ((ident1, state1), (ident2, state2)):
+            reply = self.nak(c, identifier, state)
+            self.assertEqual(reply.code_name, "Access-Challenge", reply)
+            eap = radius.eap_from_reply(reply)
+            self.assertEqual(eap[4], radius.EAP_TYPE_TTLS, eap)
+            self.assertTrue(eap[5] & radius.EAP_TTLS_S, eap)
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsUdpSingleProcess(EapTlsTestCase):
+    """UDP EAP-TTLS/PAP with spawnd's test-only single process mode."""
+
+    SPAWND = "\tsingle process = yes\n"
+    POLICY = EAP_TTLS_PAP_POLICY
+
+    def test_udp_ttls_pap_with_single_process(self):
+        peer = EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(ttls_pap_avps())
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_SUCCESS, identifier, 4))
+        self.assertEqual(cisco_avpairs(reply), [b"shell:priv-lvl=15"])
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsTcpTransport(EapTlsTestCase):
+    """RADIUS/TCP (RFC 6613) EAP-TTLS/PAP uses connection affinity and completes."""
+
+    POLICY = EAP_TTLS_PAP_POLICY
+
+    def test_radius_over_tcp_completes_ttls_pap(self):
+        c = self.radius("radsecret", tcp=True)
+        peer = EapTtlsPeer(c, self.ca, "anonymous")
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(ttls_pap_avps())
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_SUCCESS, identifier, 4))
+        self.assertEqual(cisco_avpairs(reply), [b"shell:priv-lvl=15"])
+        self.assertIs(reply.message_authenticator, True)
+
+
+@unittest.skipUnless("openssl" in features(), "EAP needs a build with OpenSSL")
+@unittest.skipUnless(tls.openssl_available(), "no openssl command to make certificates")
+class EapTtlsTlsTransport(EapTlsTestCase):
+    """RADIUS/TLS (RFC 6614) EAP-TTLS/PAP uses connection affinity and completes."""
+
+    LISTEN = {"tls": "tls = yes"}
+    UDP = False
+    TLS_TRANSPORT = True
+    POLICY = EAP_TTLS_TRANSPORT_POLICY
+
+    def radsec(self):
+        return self.radius("radsec", listener="tls", tls=self.ca.context(self.client_cert))
+
+    def test_radius_over_tls_completes_ttls_pap(self):
+        c = self.radsec()
+        peer = EapTtlsPeer(c, self.ca, "anonymous")
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(ttls_pap_avps())
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_SUCCESS, identifier, 4))
+        self.assertEqual(cisco_avpairs(reply), [b"shell:priv-lvl=15"])
+        self.assertIs(reply.message_authenticator, True)
+
+    def test_missing_message_authenticator_over_tls_is_accepted(self):
+        """RFC 6614 relaxes RFC 3579: no Message-Authenticator in the request is fine."""
+        c = self.radsec()
+        peer = EapTtlsPeer(c, self.ca, "anonymous", message_authenticator=False)
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(ttls_pap_avps())
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(reply)),
+                         (radius.EAP_SUCCESS, identifier, 4))
+        self.assertIs(reply.message_authenticator, True)
 
 
 class EapStart(EapTlsTestCase):
@@ -3763,7 +4240,9 @@ class EapOversizedMessage(EapTlsTestCase):
         eap = radius.eap_packet(radius.EAP_RESPONSE, 1, radius.EAP_TYPE_IDENTITY, b"x" * 100)
         r = c.exchange(access_request(eap), message_authenticator=True)
         self.assertEqual(r.code_name, "Access-Reject", r)
-        self.assertEqual(radius.eap_from_reply(r)[0], radius.EAP_FAILURE, r)
+        self.assertEqual(struct.unpack("!BBH", radius.eap_from_reply(r)),
+                         (radius.EAP_FAILURE, 1, 4),
+                         "EAP-Failure must carry the client's identifier")
 
 
 class EapTlsOversizedReply(EapTlsTestCase):
