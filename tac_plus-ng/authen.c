@@ -1009,6 +1009,151 @@ static void set_pwdat(tac_session *session, struct pwdat **pwdat, enum pw_ix *pw
 	*pwdat = NULL;
 }
 
+#ifdef WITH_SSL
+/*
+ * Authorization for the inner PAP identity of an EAP-TTLS session
+ * (RFC 5281 7.3). The caller has parsed the tunneled User-Name and
+ * User-Password AVPs, stripped the password's NUL padding, bounds-checked
+ * both values and passes the inner identity; the outer
+ * EAP-Response/Identity is not consulted. Reuse the password-based RADIUS
+ * path: host ACL, ruleset, user expiry, profile evaluation and reporting.
+ * The password is verified against the local credential and is never logged
+ * or copied into the session.
+ *
+ * Limitations of this cut:
+ * - MAVIS-only credentials cannot be challenged inside EAP-TTLS (there is
+ *   no password prompt and no extra RADIUS exchange), so they are denied
+ *   instead of silently bypassed.
+ * - MFA cannot be challenged inside EAP-TTLS, so a session that requires it
+ *   is denied rather than accepted without the second factor.
+ * - Only local passwords are supported; realm-level MAVIS login lookups are
+ *   not performed.
+ */
+enum token eap_ttls_authorize(tac_session *session, const char *username,
+			      const char *password, char **resp, enum hint_enum *hint)
+{
+    enum token res;
+    enum pw_ix pw_ix = PW_LOGIN;
+    struct pwdat *pwdat = NULL;
+
+    if (!username || !*username) {
+	*hint = hint_nosuchuser;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    }
+
+    /* The inner User-Name is authoritative; keep session->username in sync
+       even if a caller did not set it before. */
+    if (!session->username.txt || strcmp(session->username.txt, username)) {
+	str_set(&session->username, mem_strdup(session->mem, (char *) username), 0);
+	if (!session->username.txt) {
+	    *hint = hint_denied;
+	    report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	    return S_deny;
+	}
+    }
+
+    res = lookup_and_set_user(session);
+    if (res != S_permit) {
+	if (res != S_deny) {
+	    /* No host ACL denial was reported: no matching user account. */
+	    *hint = hint_nosuchuser;
+	    report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	    res = S_deny;
+	}
+	return res;
+    }
+
+    /* A host action may permit without a matching user account. */
+    if (!session->user) {
+	*hint = hint_denied_by_acl;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    }
+
+    /*
+     * Password-path parity for the login credential. Unlike the RADIUS
+     * password paths, refuse_rad_session() must not be used here: it sends a
+     * RADIUS Protocol-Error, while the EAP caller has to send EAP-Failure in
+     * an Access-Reject. The default S_deny credential (no login password
+     * configured) is not an explicit login = deny; the inner PAP password is
+     * the credential in that case.
+     */
+    switch (session->user->passwd[PW_LOGIN]->type) {
+    case S_deny:
+	if (session->user->passwd[PW_LOGIN] == &passwd_deny_dflt)
+	    break;
+	*hint = hint_denied;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    case S_error:
+	*hint = hint_error;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    case S_mavis:
+	*hint = hint_backend_error;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    default:
+	break;
+    }
+
+    set_mfa(session);
+    if (session->want_mfa == BISTATE_YES) {
+	*hint = hint_denied_by_acl;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    }
+
+    /*
+     * Use the login credential when configured. A user with only
+     * "password pap = clear" has no login credential, so fall back to the
+     * PAP slot; set_pwdat() resolves "password pap = login" to PW_LOGIN.
+     */
+    set_pwdat(session, &pwdat, &pw_ix);
+    if (pwdat == &passwd_deny_dflt) {
+	pw_ix = PW_PAP;
+	set_pwdat(session, &pwdat, &pw_ix);
+    }
+
+    if (!pwdat) {
+	*hint = hint_nopass;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    }
+
+    switch (pwdat->type) {
+    case S_mavis:
+	/* MAVIS-only credential: no challenge is possible in EAP-TTLS. */
+	*hint = hint_backend_error;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    case S_error:
+	*hint = hint_error;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    case S_deny:
+	*hint = hint_denied;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    case S_unknown:
+	*hint = hint_nopass;
+	report_auth(session, "radius eap-ttls pap login", *hint, S_deny);
+	return S_deny;
+    default:
+	break;
+    }
+
+    res = check_access(session, pwdat, (char *) password, hint, resp);
+    if (res == S_permit && session->profile)
+	res = author_eval_profile(session, session->profile,
+				  session->ctx->realm->script_profile_parent_first);
+
+    report_auth(session, "radius eap-ttls pap login", *hint, res);
+    return res;
+}
+#endif				/* WITH_SSL */
+
 static char *set_welcome_banner(tac_session *session, struct log_item *fmt_dflt)
 {
     if (session->welcome_banner)
