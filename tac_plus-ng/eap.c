@@ -220,17 +220,20 @@ struct eap_parsed {
     u_char identifier;
     u_short length;		/* declared length, host byte order */
     u_char type;		/* Request/Response type; 0 for Success/Failure */
-    u_char flags;		/* EAP-TLS flags, reserved bits cleared */
+    u_char flags;		/* EAP-TLS/EAP-TTLS flags, reserved bits cleared */
+    u_char version;		/* EAP-TTLS version; 0 otherwise */
     const u_char *data;
     size_t data_len;
 };
 
 /*
- * Validate the EAP header per RFC 3748 and RFC 5216 3.1/3.2:
+ * Validate the EAP header per RFC 3748, RFC 5216 3.1/3.2 and RFC 5281 3.1:
  * - at least the 4-byte header must be present;
  * - the declared length must be >= 4 and must not exceed the buffer;
  * - octets beyond the declared length are padding and are ignored;
- * - an EAP-Response/EAP-TLS with the S bit set is rejected;
+ * - EAP-TLS has one flags byte; EAP-TTLS has a flags byte and a version
+ *   byte, and L carries a 4-octet TLS Message Length;
+ * - an S bit in an EAP-Response is rejected;
  * - reserved bits are ignored on receive (cleared in *out).
  */
 static int eap_parse_hdr(const u_char *eap, size_t eap_len, struct eap_parsed *out)
@@ -273,6 +276,17 @@ static int eap_parse_hdr(const u_char *eap, size_t eap_len, struct eap_parsed *o
 	    return 0;		/* RFC 5216 3.2 */
 	out->flags &= EAP_TLS_FLAG_L | EAP_TLS_FLAG_M | EAP_TLS_FLAG_S;
 	off++;
+    } else if (out->type == EAP_TYPE_TTLS) {
+	if (length < off + 2)
+	    return 0;		/* flags and version bytes are mandatory */
+	out->flags = eap[off];
+	out->version = eap[off + 1];
+	if (hdr.code == EAP_CODE_RESPONSE && (out->flags & EAP_TTLS_FLAG_S))
+	    return 0;		/* RFC 5281 3.1 */
+	out->flags &= EAP_TTLS_FLAG_L | EAP_TTLS_FLAG_M | EAP_TTLS_FLAG_S;
+	off += 2;
+	if ((out->flags & EAP_TTLS_FLAG_L) && length < off + 4)
+	    return 0;		/* L carries a 4-octet TLS Message Length */
     }
 
     out->data = eap + off;
@@ -328,12 +342,12 @@ static int eap_store_identity(struct eap_session *es, const struct eap_parsed *p
     return 1;
 }
 
-static int eap_nak_proposes_tls(const struct eap_parsed *parsed)
+static int eap_nak_proposes(const struct eap_parsed *parsed, u_char type)
 {
     size_t i;
 
     for (i = 0; i < parsed->data_len; i++)
-	if (parsed->data[i] == EAP_TYPE_TLS)
+	if (parsed->data[i] == type)
 	    return 1;
     return 0;
 }
@@ -699,23 +713,26 @@ static enum token eap_identity_authorize(tac_session *session, struct eap_sessio
     return res;
 }
 
-/* EAP-Response/Nak proposing EAP-TLS, for RADIUS role reversal (RFC 3579 2.6.2). */
-static void eap_send_nak(tac_session *session, struct eap_session *es, u_char identifier)
+/* EAP-Response/Nak proposing the configured method, for RADIUS role reversal
+   (RFC 3579 2.6.2). */
+static void eap_send_nak(tac_session *session, struct eap_session *es, u_char identifier,
+			 u_char type)
 {
     u_char pkt[sizeof(struct eap_hdr) + 2];
     struct eap_hdr hdr = { EAP_CODE_RESPONSE, identifier, htons(sizeof(pkt)) };
 
     memcpy(pkt, &hdr, sizeof(hdr));
     pkt[4] = EAP_TYPE_NAK;
-    pkt[5] = EAP_TYPE_TLS;
+    pkt[5] = type;
     eap_send_reply(session, es, identifier, RADIUS_CODE_ACCESS_REJECT, pkt, sizeof(pkt), NULL, 0);
 }
 
 /*
  * Send an EAP-Request in an Access-Challenge with the session's State. The
  * server identifier is incremented for every new request and kept in
- * es->identifier (the last identifier sent). Only EAP-TLS carries a flags
- * byte; reserved bits are zero on send (RFC 5216 3.1). Replies to requests
+ * es->identifier (the last identifier sent). EAP-TLS carries a flags byte;
+ * EAP-TTLS carries a flags byte and the version byte (TTLSv0 only). Reserved
+ * bits are zero on send (RFC 5216 3.1, RFC 5281 3.1). Replies to requests
  * carrying State are cached (cache != 0) under the identifier of the request
  * being answered; replies to no-State requests are not, because those create
  * a new session and are never looked up by identifier.
@@ -731,6 +748,8 @@ static void eap_send_request(tac_session *session, struct eap_session *es,
 
     if (type == EAP_TYPE_TLS)
 	len++;
+    else if (type == EAP_TYPE_TTLS)
+	len += 2;		/* flags and version */
 
     pkt = mem_alloc(session->mem, len);
     if (!pkt) {
@@ -745,6 +764,10 @@ static void eap_send_request(tac_session *session, struct eap_session *es,
     pkt[off++] = type;
     if (type == EAP_TYPE_TLS)
 	pkt[off++] = flags & (EAP_TLS_FLAG_L | EAP_TLS_FLAG_M | EAP_TLS_FLAG_S);
+    else if (type == EAP_TYPE_TTLS) {
+	pkt[off++] = flags & (EAP_TTLS_FLAG_L | EAP_TTLS_FLAG_M | EAP_TTLS_FLAG_S);
+	pkt[off++] = es->ttls_version;
+    }
     if (data_len)
 	memcpy(pkt + off, data, data_len);
 
@@ -754,6 +777,29 @@ static void eap_send_request(tac_session *session, struct eap_session *es,
 		       pkt, len, es->state, es->state_len);
     else
 	rad_send_eap_reply(session, RADIUS_CODE_ACCESS_CHALLENGE, pkt, len, es->state, es->state_len);
+}
+
+/* The configured EAP method as an EAP Request/Response type. */
+static u_char eap_method_type(tac_realm *r)
+{
+    return r->eap_method == S_ttls ? EAP_TYPE_TTLS : EAP_TYPE_TLS;
+}
+
+/*
+ * Send the configured method's Start request: EAP-Request/EAP-TLS Start
+ * (RFC 5216 3.1) or EAP-Request/EAP-TTLS Start with Version 0 (RFC 5281
+ * 3.1). Only the S bit is set; reserved bits are zero on send.
+ */
+static void eap_send_start(tac_session *session, struct eap_session *es, tac_realm *r, int cache)
+{
+    u_char type = eap_method_type(r);
+
+    if (type == EAP_TYPE_TTLS) {
+	es->ttls_version = EAP_TTLS_VERSION;
+	es->flags |= EAP_F_TTLS_STARTED;
+	eap_send_request(session, es, type, EAP_TTLS_FLAG_S, NULL, 0, cache);
+    } else
+	eap_send_request(session, es, type, EAP_TLS_FLAG_S, NULL, 0, cache);
 }
 
 /*
@@ -1250,9 +1296,49 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 	es->tls_state = EAP_TLS_WAIT_FINAL_ACK;
 }
 
+/*
+ * EAP-TTLS tunnel phase. Task 19 stops at the packet layer: after Start,
+ * a client response is accepted as TTLSv0 and then failed because the TLS
+ * tunnel, the AVP layer and inner PAP (Tasks 20-23) are not implemented
+ * yet. Task 20 replaces this stub with the shared TLS handshake.
+ */
+static void eap_ttls_tunnel(tac_session *session, struct eap_session *es,
+			    const struct eap_parsed *parsed)
+{
+    report(session, LOG_WARNING, ~0,
+	   "EAP-TTLS: TLS tunnel is not implemented in this build");
+    eap_send_failure(session, es, parsed->identifier);
+}
+
+/*
+ * EAP-Response/EAP-TTLS. The packet layer (Task 19) accepts TTLSv0 only:
+ * a response with another version fails the conversation. The S bit is
+ * already rejected by eap_parse_hdr() for responses.
+ */
+static void eap_ttls_request(tac_session *session, struct eap_session *es,
+			     const struct eap_parsed *parsed)
+{
+    if ((es->flags & EAP_F_FAILED) || !(es->flags & EAP_F_TTLS_STARTED)) {
+	eap_send_failure(session, es, parsed->identifier);
+	return;
+    }
+
+    if (parsed->version != EAP_TTLS_VERSION) {
+	report(session, LOG_WARNING, ~0,
+	       "EAP-TTLS: unsupported version %u (only version %d is supported)",
+	       parsed->version, EAP_TTLS_VERSION);
+	es->flags |= EAP_F_FAILED;
+	eap_send_failure(session, es, parsed->identifier);
+	return;
+    }
+
+    eap_ttls_tunnel(session, es, parsed);
+}
+
 void eap_radius_request(tac_session *session)
 {
     tac_realm *r = session->ctx->realm;
+    u_char method = eap_method_type(r);
     struct eap_parsed parsed;
     struct eap_cached_reply *cached;
     struct eap_session *es;
@@ -1300,7 +1386,7 @@ void eap_radius_request(tac_session *session)
        Do not cache the Nak under the offending identifier: a later
        legitimate request could replay it. */
     if (parsed.code != EAP_CODE_RESPONSE) {
-	eap_send_nak(session, NULL, identifier);
+	eap_send_nak(session, NULL, identifier, method);
 	return;
     }
 
@@ -1320,10 +1406,10 @@ void eap_radius_request(tac_session *session)
 	    es->client_identifier = identifier;
 	    es->success_identifier = identifier;
 	    es->flags |= EAP_F_IDENTITY_SEEN;
-	    eap_send_request(session, es, EAP_TYPE_TLS, EAP_TLS_FLAG_S, NULL, 0, 0);
+	    eap_send_start(session, es, r, 0);
 	    return;
 	case EAP_TYPE_NAK:
-	    if (!eap_nak_proposes_tls(&parsed)) {
+	    if (!eap_nak_proposes(&parsed, method)) {
 		eap_send_failure(session, NULL, identifier);
 		return;
 	    }
@@ -1334,7 +1420,7 @@ void eap_radius_request(tac_session *session)
 	    }
 	    es->client_identifier = identifier;
 	    es->success_identifier = identifier;
-	    eap_send_request(session, es, EAP_TYPE_TLS, EAP_TLS_FLAG_S, NULL, 0, 0);
+	    eap_send_start(session, es, r, 0);
 	    return;
 	default:
 	    eap_send_failure(session, NULL, identifier);
@@ -1435,17 +1521,28 @@ void eap_radius_request(tac_session *session)
 	    es->success_identifier = identifier;
 	    es->flags |= EAP_F_IDENTITY_SEEN;
 	    es->flags &= ~EAP_F_IDENTITY_REQUESTED;
-	    eap_send_request(session, es, EAP_TYPE_TLS, EAP_TLS_FLAG_S, NULL, 0, 0);
+	    eap_send_start(session, es, r, 0);
 	    return;
 	}
 	eap_send_failure(session, es, identifier);
 	return;
     case EAP_TYPE_TLS:
+	if (r->eap_method != S_tls) {
+	    eap_send_failure(session, es, identifier);
+	    return;
+	}
 	eap_tls_request(session, es, &parsed);
 	return;
+    case EAP_TYPE_TTLS:
+	if (r->eap_method != S_ttls) {
+	    eap_send_failure(session, es, identifier);
+	    return;
+	}
+	eap_ttls_request(session, es, &parsed);
+	return;
     case EAP_TYPE_NAK:
-	if (eap_nak_proposes_tls(&parsed))
-	    eap_send_request(session, es, EAP_TYPE_TLS, EAP_TLS_FLAG_S, NULL, 0, 1);
+	if (eap_nak_proposes(&parsed, method))
+	    eap_send_start(session, es, r, 1);
 	else
 	    eap_send_failure(session, es, identifier);
 	return;

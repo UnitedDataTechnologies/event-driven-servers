@@ -34,10 +34,11 @@
               timeout, exchange() checks the Response Authenticator,
               access_request() with a PAP User-Password of arbitrary bytes
 
-EAP helpers (RFC 3748, RFC 5216, RFC 3579): eap_packet() and eap_tls_packet()
-build EAP packets, eap_tls_ack() the empty fragment ACK, eap_attributes()
-splits an EAP packet into 253-byte EAP-Message attributes, and
-eap_from_reply() concatenates them again.
+EAP helpers (RFC 3748, RFC 5216, RFC 5281, RFC 3579): eap_packet(),
+eap_tls_packet() and eap_ttls_packet() build EAP packets, eap_tls_ack() the
+empty fragment ACK, eap_ttls_start() an EAP-Request/TTLS Start,
+eap_attributes() splits an EAP packet into 253-byte EAP-Message attributes,
+and eap_from_reply() concatenates them again.
 
 Message-Authenticator (RFC 3579 3.2) is added on request;
 reply_message_authenticator() checks the one in a reply. Over TLS the
@@ -74,6 +75,13 @@ EAP_TYPE_TLS = 13
 EAP_TLS_L = 0x80
 EAP_TLS_M = 0x40
 EAP_TLS_S = 0x20
+
+# EAP-TTLS (RFC 5281 3.1): type 21, the same L/M/S bits, and Version 0
+EAP_TYPE_TTLS = 21
+EAP_TTLS_L = 0x80
+EAP_TTLS_M = 0x40
+EAP_TTLS_S = 0x20
+EAP_TTLS_VERSION = 0
 
 HEADER_LEN = 20
 
@@ -185,6 +193,24 @@ def eap_tls_packet(code, identifier, flags, data=b"", total=None):
 def eap_tls_ack(identifier):
     """Empty EAP-Response/EAP-TLS ACK: 6 bytes, flags=0."""
     return eap_tls_packet(EAP_RESPONSE, identifier, 0)
+
+
+def eap_ttls_packet(code, identifier, flags, version=EAP_TTLS_VERSION, data=b"", total=None):
+    """EAP-TTLS packet: type 21, flags byte, version byte, optional 4-byte total length.
+
+    RFC 5281 3.1: the flags use the EAP-TLS bit values; Version 0 is TTLSv0.
+    With L set, the four-octet TLS Message Length follows the version byte.
+    """
+    body = bytes([EAP_TYPE_TTLS, flags, version])
+    if flags & EAP_TTLS_L:
+        body += struct.pack("!I", total if total is not None else len(data))
+    body += data
+    return struct.pack("!BBH", code, identifier, 4 + len(body)) + body
+
+
+def eap_ttls_start(identifier):
+    """EAP-Request/EAP-TTLS Start: type 21, S set, version 0, no data (RFC 5281 3.1)."""
+    return eap_ttls_packet(EAP_REQUEST, identifier, EAP_TTLS_S)
 
 
 def eap_attributes(eap):

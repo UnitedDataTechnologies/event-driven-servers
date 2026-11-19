@@ -71,11 +71,19 @@
 #define EAP_TYPE_NOTIFICATION 2
 #define EAP_TYPE_NAK        3
 #define EAP_TYPE_TLS        13
+#define EAP_TYPE_TTLS       21
 
 #define EAP_TLS_FLAG_L      0x80
 #define EAP_TLS_FLAG_M      0x40
 #define EAP_TLS_FLAG_S      0x20
 #define EAP_TLS_FLAG_RESERVED 0x1f	/* Request; Response reserved is 0x3f */
+
+/* EAP-TTLS (RFC 5281 3.1): same L/M/S bit values as EAP-TLS, Version 0. */
+#define EAP_TTLS_FLAG_L     0x80
+#define EAP_TTLS_FLAG_M     0x40
+#define EAP_TTLS_FLAG_S     0x20
+#define EAP_TTLS_FLAG_RESERVED 0x1f
+#define EAP_TTLS_VERSION    0
 
 #define EAP_STATE_LEN       16
 #define EAP_INVALID_LIMIT   5
@@ -138,8 +146,10 @@ struct eap_session {
 #define EAP_F_COMPLETED     0x20
 #define EAP_F_ALERT_SENT    0x40
 #define EAP_F_IDENTITY_REQUESTED 0x80
+#define EAP_F_TTLS_STARTED  0x100
 
     enum eap_tls_state tls_state;
+    u_char ttls_version;	/* negotiated EAP-TTLS version, 0 for TTLSv0 */
     str_t identity;		/* EAP-Response/Identity, unauthenticated */
     SSL *ssl;
     BIO *rbio;
