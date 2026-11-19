@@ -80,6 +80,10 @@ SAMPLE_EXCLUDED = {
         "the democa certificates must be generated first (make -C tac_plus-ng/sample/democa); "
         "fails without a message",
         None),
+    "sample/tac_plus-ng-eap-ttls.cfg": (
+        "the democa certificates must be generated first (make -C tac_plus-ng/sample/democa); "
+        "fails without a message",
+        None),
     "sample/tls-fingerprint-demo/tac_plus-ng-fingerprint.cfg": (
         "includes client.selfsigned.fingerprint, which tls-fingerprint-demo/mkcert.sh generates",
         "client.selfsigned.fingerprint"),
@@ -98,6 +102,7 @@ NEEDS_OPENSSL = {
     "sample/tac_plus-ng-radsec.cfg": "but got 'tls'",
     "sample/tls-fingerprint-demo/tac_plus-ng-fingerprint.cfg": "but got 'tls'",
     "sample/tac_plus-ng-eap.cfg": "but got 'eap'",
+    "sample/tac_plus-ng-eap-ttls.cfg": "but got 'eap'",
 }
 
 # These exercise the realm eap block, which only exists in OpenSSL builds.
