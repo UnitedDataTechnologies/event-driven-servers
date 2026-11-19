@@ -2122,6 +2122,113 @@ class EapTtlsPap(EapTlsTestCase):
         self.assert_failure(peer, reply, identifier)
 
 
+class EapTtlsMppeKeys(EapTlsTestCase):
+    """RFC 5281 7.1 / RFC 2548 2.4.2: MS-MPPE keys from the TTLS keying material."""
+
+    POLICY = EAP_TTLS_PAP_POLICY
+
+    @staticmethod
+    def pap_avps(user_name=b"pap-user", password=b"papsecret"):
+        return radius.eap_ttls_avps(radius.eap_ttls_avp(radius.AVP_USER_NAME, user_name),
+                                    radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, password))
+
+    def phase2(self, password=b"papsecret"):
+        peer = EapTtlsPeer(self.radius("radsecret"), self.ca, "anonymous")
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(self.pap_avps(password=password))
+        return peer, identifier, reply
+
+    def test_access_accept_carries_encrypted_ms_mppe_keys(self):
+        peer, identifier, reply = self.phase2()
+        request = peer.last_request
+        assert request is not None
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        eap = radius.eap_from_reply(reply)
+        self.assertEqual(struct.unpack("!BBH", eap),
+                         (radius.EAP_SUCCESS, identifier, 4))
+        self.assertFalse(reply.get(radius.STATE))
+        self.assertEqual(cisco_avpairs(reply), [b"shell:priv-lvl=15"],
+                         "profile attribute missing from Access-Accept")
+
+        recv_values = mppe_vsa_values(reply, MS_MPPE_RECV_KEY)
+        send_values = mppe_vsa_values(reply, MS_MPPE_SEND_KEY)
+        self.assertEqual(len(recv_values), 1, reply)
+        self.assertEqual(len(send_values), 1, reply)
+
+        recv_key, recv_salt = mppe_decrypt(recv_values[0], b"radsecret",
+                                           request.authenticator)
+        send_key, send_salt = mppe_decrypt(send_values[0], b"radsecret",
+                                           request.authenticator)
+        self.assertEqual(len(recv_key), 32)
+        self.assertEqual(len(send_key), 32)
+        self.assertNotEqual(recv_key, bytes(32))
+        self.assertNotEqual(send_key, bytes(32))
+        self.assertNotEqual(recv_key, send_key)
+        self.assertNotEqual(recv_salt, send_salt)
+        self.assertEqual(mppe_vsa_values(reply, MS_MPPE_ENCRYPTION_POLICY),
+                         [struct.pack("!I", 1)])
+        self.assertEqual(mppe_vsa_values(reply, MS_MPPE_ENCRYPTION_TYPES),
+                         [struct.pack("!I", 6)])
+
+    def test_retransmitted_access_request_reencrypts_keys(self):
+        """A retransmission has a new Request Authenticator; the MSK is re-encrypted."""
+        peer, identifier, first_reply = self.phase2()
+        first_request = peer.last_request
+        assert first_request is not None
+        self.assertEqual(first_reply.code_name, "Access-Accept", first_reply)
+
+        first_recv, first_recv_salt = mppe_decrypt(
+            mppe_vsa_values(first_reply, MS_MPPE_RECV_KEY)[0],
+            b"radsecret", first_request.authenticator)
+        first_send, first_send_salt = mppe_decrypt(
+            mppe_vsa_values(first_reply, MS_MPPE_SEND_KEY)[0],
+            b"radsecret", first_request.authenticator)
+
+        # Same EAP packet, attributes and State, but a new Request Authenticator.
+        resent_request = radius.Packet(radius.ACCESS_REQUEST,
+                                       identifier=first_request.identifier,
+                                       attributes=first_request.attributes)
+        self.assertNotEqual(resent_request.authenticator, first_request.authenticator)
+        resent = peer.client.exchange(resent_request, message_authenticator=True)
+        self.assertEqual(resent.code_name, "Access-Accept", resent)
+
+        ack_eap = b"".join(v for t, v in first_request.attributes
+                           if t == radius.EAP_MESSAGE)
+        eap = radius.eap_from_reply(resent)
+        self.assertEqual(len(eap), 4, eap)
+        self.assertEqual(struct.unpack("!BBH", eap),
+                         (radius.EAP_SUCCESS, ack_eap[1], 4))
+        self.assertFalse(resent.get(radius.STATE))
+        self.assertEqual(cisco_avpairs(resent), [b"shell:priv-lvl=15"],
+                         "retransmitted Access-Accept lost the profile AVPs")
+
+        recv_values = mppe_vsa_values(resent, MS_MPPE_RECV_KEY)
+        send_values = mppe_vsa_values(resent, MS_MPPE_SEND_KEY)
+        self.assertEqual(len(recv_values), 1, resent)
+        self.assertEqual(len(send_values), 1, resent)
+        recv_key, recv_salt = mppe_decrypt(recv_values[0], b"radsecret",
+                                           resent_request.authenticator)
+        send_key, send_salt = mppe_decrypt(send_values[0], b"radsecret",
+                                           resent_request.authenticator)
+        self.assertEqual(recv_key, first_recv)
+        self.assertEqual(send_key, first_send)
+        self.assertNotEqual(recv_salt, first_recv_salt)
+        self.assertNotEqual(send_salt, first_send_salt)
+        self.assertNotEqual(recv_salt, send_salt)
+        self.assertEqual(mppe_vsa_values(resent, MS_MPPE_ENCRYPTION_POLICY),
+                         [struct.pack("!I", 1)])
+        self.assertEqual(mppe_vsa_values(resent, MS_MPPE_ENCRYPTION_TYPES),
+                         [struct.pack("!I", 6)])
+
+    def test_failed_authentication_carries_no_keys(self):
+        peer, identifier, reply = self.phase2(password=b"wrong")
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+        self.assertEqual(mppe_vsa_values(reply, MS_MPPE_RECV_KEY), [])
+        self.assertEqual(mppe_vsa_values(reply, MS_MPPE_SEND_KEY), [])
+        self.assertEqual(mppe_vsa_values(reply, MS_MPPE_ENCRYPTION_POLICY), [])
+        self.assertEqual(mppe_vsa_values(reply, MS_MPPE_ENCRYPTION_TYPES), [])
+
+
 class EapTtlsFragmentedServerFlight(EapTlsTestCase):
     """A TTLS server flight over EAP_MAX_FRAGMENT: TTLS L/M flags and one fragment per ACK."""
 
