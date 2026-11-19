@@ -296,6 +296,162 @@ static int eap_parse_hdr(const u_char *eap, size_t eap_len, struct eap_parsed *o
     return 1;
 }
 
+/*
+ * EAP-TTLS AVP iterator (RFC 5281 10.1). One AVP is a 4-octet code, a flags
+ * byte (V/M), a 3-octet length, an optional 4-octet Vendor-ID when V is set,
+ * data, and zero padding to a 4-octet boundary. The length includes the
+ * 8-octet header (12 with a Vendor-ID) but excludes padding.
+ *
+ * Returns EAP_TTLS_AVP_OK with *avp filled and *off advanced, END at the end
+ * of the sequence, MALFORMED for a truncated AVP, a length below the header
+ * size, a length over the buffer or max_message, impossible padding, or
+ * RADIUS attribute 26 used as a code, and UNKNOWN_MANDATORY for an unknown
+ * AVP with M set. Unknown AVPs with M clear are OK and ignored by the caller.
+ *
+ * Never log avp->data: it may carry a cleartext User-Password inside the TLS
+ * tunnel.
+ */
+static int eap_ttls_avp_next(const u_char *buf, size_t len, size_t *off,
+			     size_t max_message, struct eap_ttls_avp *avp)
+    __attribute__((unused));
+
+static int eap_ttls_avp_next(const u_char *buf, size_t len, size_t *off,
+			     size_t max_message, struct eap_ttls_avp *avp)
+{
+    size_t remaining, hdr, length, padded;
+    uint32_t code;
+    u_char flags;
+
+    if (!buf || !off || !avp || *off > len)
+	return EAP_TTLS_AVP_MALFORMED;
+    if (*off == len)
+	return EAP_TTLS_AVP_END;
+
+    remaining = len - *off;
+    if (remaining < EAP_TTLS_AVP_HDR_LEN)
+	return EAP_TTLS_AVP_MALFORMED;
+
+    memcpy(&code, buf + *off, sizeof(code));
+    code = ntohl(code);
+    flags = buf[*off + 4];
+    length = ((size_t) buf[*off + 5] << 16) |
+	     ((size_t) buf[*off + 6] << 8) | (size_t) buf[*off + 7];
+
+    if (code == EAP_TTLS_AVP_CODE_RADIUS_VENDOR_SPECIFIC)
+	return EAP_TTLS_AVP_MALFORMED;
+    if (length > max_message)
+	return EAP_TTLS_AVP_MALFORMED;
+
+    hdr = EAP_TTLS_AVP_HDR_LEN;
+    if (flags & EAP_TTLS_AVP_FLAG_V)
+	hdr += EAP_TTLS_AVP_VENDOR_LEN;
+    if (length < hdr)
+	return EAP_TTLS_AVP_MALFORMED;
+    if (length > remaining)
+	return EAP_TTLS_AVP_MALFORMED;
+
+    padded = (length + 3) & ~(size_t) 3;
+    if (padded > remaining)
+	return EAP_TTLS_AVP_MALFORMED;
+
+    memset(avp, 0, sizeof(*avp));
+    avp->code = code;
+    avp->flags = flags & (EAP_TTLS_AVP_FLAG_V | EAP_TTLS_AVP_FLAG_M);
+    if (flags & EAP_TTLS_AVP_FLAG_V) {
+	uint32_t vendor;
+
+	memcpy(&vendor, buf + *off + EAP_TTLS_AVP_HDR_LEN, sizeof(vendor));
+	avp->vendor_id = ntohl(vendor);
+    }
+    avp->data = buf + *off + hdr;
+    avp->data_len = length - hdr;
+
+    if (code != EAP_TTLS_AVP_USER_NAME && code != EAP_TTLS_AVP_USER_PASSWORD &&
+	(flags & EAP_TTLS_AVP_FLAG_M))
+	return EAP_TTLS_AVP_UNKNOWN_MANDATORY;
+
+    *off += padded;
+    return EAP_TTLS_AVP_OK;
+}
+
+/*
+ * Encode one EAP-TTLS AVP into buf. Returns the number of bytes written,
+ * including zero padding, or 0 when the AVP is invalid or does not fit.
+ * Reserved flag bits are cleared; RADIUS attribute 26 is not an AVP code.
+ */
+static size_t eap_ttls_avp_encode(u_char *buf, size_t buflen, uint32_t code,
+				  u_char flags, uint32_t vendor_id,
+				  const u_char *data, size_t data_len)
+    __attribute__((unused));
+
+static size_t eap_ttls_avp_encode(u_char *buf, size_t buflen, uint32_t code,
+				  u_char flags, uint32_t vendor_id,
+				  const u_char *data, size_t data_len)
+{
+    size_t hdr = EAP_TTLS_AVP_HDR_LEN, length, padded;
+    uint32_t net;
+
+    if (!buf || (!data && data_len))
+	return 0;
+    if (code == EAP_TTLS_AVP_CODE_RADIUS_VENDOR_SPECIFIC)
+	return 0;
+
+    flags &= EAP_TTLS_AVP_FLAG_V | EAP_TTLS_AVP_FLAG_M;
+    if (flags & EAP_TTLS_AVP_FLAG_V)
+	hdr += EAP_TTLS_AVP_VENDOR_LEN;
+    if (data_len > 0xffffff - hdr)
+	return 0;
+
+    length = hdr + data_len;
+    padded = (length + 3) & ~(size_t) 3;
+    if (padded > buflen)
+	return 0;
+
+    net = htonl(code);
+    memcpy(buf, &net, sizeof(net));
+    buf[4] = flags;
+    buf[5] = (u_char) (length >> 16);
+    buf[6] = (u_char) (length >> 8);
+    buf[7] = (u_char) length;
+    if (flags & EAP_TTLS_AVP_FLAG_V) {
+	uint32_t vendor = htonl(vendor_id);
+
+	memcpy(buf + EAP_TTLS_AVP_HDR_LEN, &vendor, sizeof(vendor));
+    }
+    if (data_len)
+	memcpy(buf + hdr, data, data_len);
+    memset(buf + length, 0, padded - length);
+    return padded;
+}
+
+/*
+ * Validate a complete AVP sequence (zero or more AVPs). Returns 1 when every
+ * AVP is well-formed (unknown optional AVPs are ignored), 0 for a malformed
+ * AVP or a sequence over max_message, and -1 for an unknown mandatory AVP.
+ */
+static int eap_ttls_avp_validate(const u_char *buf, size_t len, size_t max_message)
+    __attribute__((unused));
+
+static int eap_ttls_avp_validate(const u_char *buf, size_t len, size_t max_message)
+{
+    struct eap_ttls_avp avp;
+    size_t off = 0;
+    int status;
+
+    if (len > max_message)
+	return 0;
+
+    while ((status = eap_ttls_avp_next(buf, len, &off, max_message, &avp)) ==
+	   EAP_TTLS_AVP_OK)
+	;
+
+    if (status == EAP_TTLS_AVP_END)
+	return 1;
+    if (status == EAP_TTLS_AVP_UNKNOWN_MANDATORY)
+	return -1;
+    return 0;
+}
+
 static struct eap_session *eap_lookup(tac_session *session, const u_char *state, size_t state_len);
 static struct eap_session *eap_new_session(tac_session *session);
 static struct eap_session *eap_find_initial_duplicate(tac_session *session);

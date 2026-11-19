@@ -66,6 +66,32 @@
 #define EAP_TTLS_FLAG_RESERVED 0x1f
 #define EAP_TTLS_VERSION    0
 
+/* EAP-TTLS AVPs (RFC 5281 10.1): 4-octet code, flags, 3-octet length,
+   optional Vendor-ID, data, zero padding to a 4-octet boundary. */
+#define EAP_TTLS_AVP_USER_NAME     1
+#define EAP_TTLS_AVP_USER_PASSWORD 2
+#define EAP_TTLS_AVP_FLAG_V        0x80
+#define EAP_TTLS_AVP_FLAG_M        0x40
+#define EAP_TTLS_AVP_FLAG_RESERVED 0x3f
+#define EAP_TTLS_AVP_HDR_LEN       8	/* code, flags and length */
+#define EAP_TTLS_AVP_VENDOR_LEN    4	/* Vendor-ID when V is set */
+#define EAP_TTLS_AVP_CODE_RADIUS_VENDOR_SPECIFIC 26
+
+struct eap_ttls_avp {
+    uint32_t code;		/* host byte order */
+    u_char flags;		/* V/M, reserved bits cleared */
+    uint32_t vendor_id;		/* host byte order; valid when V is set */
+    const u_char *data;
+    size_t data_len;
+};
+
+enum eap_ttls_avp_status {
+    EAP_TTLS_AVP_MALFORMED = -1,
+    EAP_TTLS_AVP_UNKNOWN_MANDATORY = -2,
+    EAP_TTLS_AVP_END = 0,
+    EAP_TTLS_AVP_OK = 1,
+};
+
 #define EAP_STATE_LEN       16
 #define EAP_INVALID_LIMIT   5
 #define EAP_DEFAULT_TIMEOUT 60
