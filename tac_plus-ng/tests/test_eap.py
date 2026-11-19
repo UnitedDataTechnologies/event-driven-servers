@@ -333,6 +333,64 @@ def eap_get_state(attributes):
     return None
 
 
+class AvpError(ValueError):
+    """A malformed EAP-TTLS AVP."""
+
+
+class UnknownMandatoryAvp(AvpError):
+    """An unknown AVP with the M bit set fails the negotiation (RFC 5281 10.1)."""
+
+
+def eap_ttls_avp_parse(buf, max_message=65535):
+    """Reference model of the C AVP iterator (RFC 5281 10.1).
+
+    Returns a list of {"code", "flags", "vendor_id", "data"} for the known
+    AVPs (User-Name 1, User-Password 2). Unknown AVPs with M set raise
+    UnknownMandatoryAvp; unknown AVPs with M clear are ignored. Raises
+    AvpError for a truncated AVP, a length below the header size, a length
+    over the buffer or max_message, impossible padding, or AVP code 26
+    (RADIUS attribute 26 is not used inside EAP-TTLS).
+    """
+    if len(buf) > max_message:
+        raise AvpError("AVP sequence longer than max-message")
+    avps = []
+    off = 0
+    while off < len(buf):
+        if len(buf) - off < radius.AVP_HDR_LEN:
+            raise AvpError("truncated AVP header")
+        code = struct.unpack("!I", buf[off:off + 4])[0]
+        flags = buf[off + 4]
+        length = int.from_bytes(buf[off + 5:off + 8], "big")
+        if code == radius.AVP_CODE_RADIUS_VENDOR_SPECIFIC:
+            raise AvpError("RADIUS attribute 26 is not an AVP code")
+        hdr = radius.AVP_HDR_LEN
+        vendor_id = None
+        if flags & radius.AVP_FLAG_V:
+            hdr += radius.AVP_VENDOR_LEN
+            if len(buf) - off < hdr:
+                raise AvpError("truncated vendor-specific AVP header")
+            vendor_id = struct.unpack("!I", buf[off + radius.AVP_HDR_LEN:off + hdr])[0]
+        if length < hdr:
+            raise AvpError("AVP length %d below header size %d" % (length, hdr))
+        if length > max_message:
+            raise AvpError("AVP length over max-message")
+        if off + length > len(buf):
+            raise AvpError("AVP length over buffer")
+        padded = (length + 3) & ~3
+        if off + padded > len(buf):
+            raise AvpError("impossible AVP padding")
+        data = buf[off + hdr:off + length]
+        if code not in (radius.AVP_USER_NAME, radius.AVP_USER_PASSWORD):
+            if flags & radius.AVP_FLAG_M:
+                raise UnknownMandatoryAvp("unknown mandatory AVP code %d" % code)
+        else:
+            avps.append({"code": code,
+                         "flags": flags & (radius.AVP_FLAG_V | radius.AVP_FLAG_M),
+                         "vendor_id": vendor_id, "data": data})
+        off += padded
+    return avps
+
+
 class EapParsing(unittest.TestCase):
     """RFC 3748 / RFC 5216 3.1/3.2 parsing rules.
 
@@ -462,6 +520,148 @@ class EapParsing(unittest.TestCase):
             bytes([radius.EAP_TYPE_TTLS, radius.EAP_TTLS_L, 0])
         with self.assertRaises(ValueError):
             eap_parse_hdr(eap)
+
+
+class EapTtlsAvp(unittest.TestCase):
+    """RFC 5281 10.1: the EAP-TTLS AVP parser and encoder reference model.
+
+    An AVP is a 4-octet code, a flags byte (V/M), a 3-octet length that
+    includes the 8-octet header (12 with a Vendor-ID) but excludes padding,
+    an optional 4-octet Vendor-ID, the data, and zero padding to a 4-octet
+    boundary. Unknown AVPs with M set fail the negotiation; unknown AVPs
+    with M clear are ignored. RADIUS attribute 26 is not an AVP code.
+    """
+
+    def test_user_name_avp(self):
+        avp = radius.eap_ttls_avp(radius.AVP_USER_NAME, b"alice")
+        self.assertEqual(len(avp), 16)
+        self.assertEqual(avp[:4], struct.pack("!I", radius.AVP_USER_NAME))
+        self.assertEqual(avp[4], 0)
+        self.assertEqual(int.from_bytes(avp[5:8], "big"), 13)
+        self.assertEqual(avp[8:13], b"alice")
+        self.assertEqual(avp[13:], bytes(3))
+        self.assertEqual(eap_ttls_avp_parse(avp),
+                         [{"code": radius.AVP_USER_NAME, "flags": 0,
+                           "vendor_id": None, "data": b"alice"}])
+
+    def test_user_password_avp(self):
+        avp = radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, b"secret")
+        parsed = eap_ttls_avp_parse(avp)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["code"], radius.AVP_USER_PASSWORD)
+        self.assertEqual(parsed[0]["data"], b"secret")
+
+    def test_four_octet_padding(self):
+        """One data byte pads the 9-byte AVP to 12 bytes with zeroes."""
+        avp = radius.eap_ttls_avp(radius.AVP_USER_NAME, b"x")
+        self.assertEqual(len(avp), 12)
+        self.assertEqual(avp[9:12], bytes(3))
+
+    def test_length_excludes_padding(self):
+        avp = radius.eap_ttls_avp(radius.AVP_USER_NAME, b"x")
+        self.assertEqual(int.from_bytes(avp[5:8], "big"), 9)
+
+    def test_vendor_avp_length_includes_header_and_vendor_id(self):
+        avp = radius.eap_ttls_avp(radius.AVP_USER_NAME, b"bob",
+                                   flags=radius.AVP_FLAG_V, vendor_id=311)
+        self.assertEqual(len(avp), 16)
+        self.assertEqual(avp[4], radius.AVP_FLAG_V)
+        self.assertEqual(int.from_bytes(avp[5:8], "big"), 15)
+        self.assertEqual(struct.unpack("!I", avp[8:12])[0], 311)
+        self.assertEqual(avp[12:15], b"bob")
+        parsed = eap_ttls_avp_parse(avp)
+        self.assertEqual(parsed[0]["vendor_id"], 311)
+        self.assertEqual(parsed[0]["data"], b"bob")
+
+    def test_avp_sequence_with_user_name_and_password(self):
+        seq = radius.eap_ttls_avps(radius.eap_ttls_avp(radius.AVP_USER_NAME, b"alice"),
+                                   radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, b"secret"))
+        parsed = eap_ttls_avp_parse(seq)
+        self.assertEqual([a["code"] for a in parsed],
+                         [radius.AVP_USER_NAME, radius.AVP_USER_PASSWORD])
+        self.assertEqual(parsed[0]["data"], b"alice")
+        self.assertEqual(parsed[1]["data"], b"secret")
+
+    def test_empty_avp_sequence(self):
+        """Zero AVPs is a valid AVP sequence (RFC 5281 10.1)."""
+        self.assertEqual(eap_ttls_avp_parse(b""), [])
+
+    def test_truncated_avp_header(self):
+        with self.assertRaises(AvpError):
+            eap_ttls_avp_parse(b"\x00\x00\x01")
+
+    def test_truncated_vendor_header(self):
+        """V is set but the 4-octet Vendor-ID is missing."""
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + bytes([radius.AVP_FLAG_V]) + \
+            (12).to_bytes(3, "big")
+        with self.assertRaises(AvpError):
+            eap_ttls_avp_parse(raw)
+
+    def test_length_below_header_size(self):
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + (4).to_bytes(3, "big")
+        with self.assertRaises(AvpError):
+            eap_ttls_avp_parse(raw)
+
+    def test_length_over_buffer(self):
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + \
+            (100).to_bytes(3, "big") + b"x"
+        with self.assertRaises(AvpError):
+            eap_ttls_avp_parse(raw)
+
+    def test_impossible_padding(self):
+        """Length 9 needs three padding bytes, but the buffer ends after nine."""
+        raw = struct.pack("!I", radius.AVP_USER_NAME) + b"\x00" + \
+            (9).to_bytes(3, "big") + b"x"
+        with self.assertRaises(AvpError):
+            eap_ttls_avp_parse(raw)
+
+    def test_unknown_mandatory_avp_fails(self):
+        raw = radius.eap_ttls_avp(99, b"x", flags=radius.AVP_FLAG_M)
+        with self.assertRaises(UnknownMandatoryAvp):
+            eap_ttls_avp_parse(raw)
+
+    def test_unknown_optional_avp_is_ignored(self):
+        seq = radius.eap_ttls_avp(99, b"x") + radius.eap_ttls_avp(radius.AVP_USER_NAME, b"alice")
+        parsed = eap_ttls_avp_parse(seq)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["data"], b"alice")
+
+    def test_unknown_vendor_avp_with_m_is_rejected(self):
+        raw = radius.eap_ttls_avp(99, b"x", flags=radius.AVP_FLAG_V | radius.AVP_FLAG_M,
+                                   vendor_id=9)
+        with self.assertRaises(UnknownMandatoryAvp):
+            eap_ttls_avp_parse(raw)
+
+    def test_radius_attribute_26_is_rejected(self):
+        """RADIUS attribute 26 (Vendor-Specific) is not used inside EAP-TTLS."""
+        # Built by hand: the encoder also refuses code 26, and this pins the
+        # parser's independent rejection of it.
+        raw = struct.pack("!I", 26) + b"\x00" + (9).to_bytes(3, "big") + b"x" + bytes(3)
+        with self.assertRaises(AvpError):
+            eap_ttls_avp_parse(raw)
+
+    def test_avp_length_over_max_message(self):
+        avp = radius.eap_ttls_avp(radius.AVP_USER_NAME, b"alice")
+        with self.assertRaises(AvpError):
+            eap_ttls_avp_parse(avp, max_message=8)
+
+    def test_sequence_over_max_message(self):
+        seq = radius.eap_ttls_avps(radius.eap_ttls_avp(radius.AVP_USER_NAME, b"a"),
+                                   radius.eap_ttls_avp(radius.AVP_USER_NAME, b"b"))
+        with self.assertRaises(AvpError):
+            eap_ttls_avp_parse(seq, max_message=8)
+
+    def test_encoder_rejects_vendor_flag_without_vendor_id(self):
+        with self.assertRaises(ValueError):
+            radius.eap_ttls_avp(99, b"x", flags=radius.AVP_FLAG_V)
+
+    def test_encoder_rejects_vendor_id_without_v_flag(self):
+        with self.assertRaises(ValueError):
+            radius.eap_ttls_avp(99, b"x", vendor_id=9)
+
+    def test_encoder_rejects_code_26(self):
+        with self.assertRaises(ValueError):
+            radius.eap_ttls_avp(26, b"x")
 
 
 class TlsProfile(unittest.TestCase):

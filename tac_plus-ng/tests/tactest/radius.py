@@ -83,6 +83,16 @@ EAP_TTLS_M = 0x40
 EAP_TTLS_S = 0x20
 EAP_TTLS_VERSION = 0
 
+# EAP-TTLS AVPs (RFC 5281 10.1): 4-octet code, flags, 3-octet length,
+# optional Vendor-ID, data, zero padding to a 4-octet boundary.
+AVP_USER_NAME = 1
+AVP_USER_PASSWORD = 2
+AVP_FLAG_V = 0x80
+AVP_FLAG_M = 0x40
+AVP_HDR_LEN = 8
+AVP_VENDOR_LEN = 4
+AVP_CODE_RADIUS_VENDOR_SPECIFIC = 26
+
 HEADER_LEN = 20
 
 
@@ -211,6 +221,39 @@ def eap_ttls_packet(code, identifier, flags, version=EAP_TTLS_VERSION, data=b"",
 def eap_ttls_start(identifier):
     """EAP-Request/EAP-TTLS Start: type 21, S set, version 0, no data (RFC 5281 3.1)."""
     return eap_ttls_packet(EAP_REQUEST, identifier, EAP_TTLS_S)
+
+
+def eap_ttls_avp(code, data=b"", flags=0, vendor_id=None):
+    """One EAP-TTLS AVP (RFC 5281 10.1).
+
+    code is a RADIUS/Diameter AVP code; flags carries V/M. A Vendor-ID is
+    required with V and forbidden without it. The 3-octet length includes
+    the 8-octet header (12 with a Vendor-ID) but excludes the zero padding
+    to a 4-octet boundary.
+    """
+    data = _b(data)
+    if code == AVP_CODE_RADIUS_VENDOR_SPECIFIC:
+        raise ValueError("RADIUS attribute 26 is not an EAP-TTLS AVP code")
+    if flags & AVP_FLAG_V:
+        if vendor_id is None:
+            raise ValueError("the V flag requires a Vendor-ID")
+    elif vendor_id is not None:
+        raise ValueError("a Vendor-ID requires the V flag")
+    hdr = AVP_HDR_LEN + (AVP_VENDOR_LEN if flags & AVP_FLAG_V else 0)
+    length = hdr + len(data)
+    if length > 0xffffff:
+        raise ValueError("AVP length does not fit the 3-octet length field")
+    out = struct.pack("!I", code) + bytes([flags & (AVP_FLAG_V | AVP_FLAG_M)]) + \
+        length.to_bytes(3, "big")
+    if flags & AVP_FLAG_V:
+        out += struct.pack("!I", vendor_id)
+    out += data
+    return out + bytes((-length) % 4)
+
+
+def eap_ttls_avps(*avps):
+    """Concatenate encoded AVPs into a zero-or-more AVP sequence."""
+    return b"".join(avps)
 
 
 def eap_attributes(eap):
