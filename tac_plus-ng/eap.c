@@ -1290,16 +1290,29 @@ static void eap_tls_fail(tac_session *session, struct eap_session *es, const cha
 }
 
 /*
- * RFC 5216 2.3 / RFC 5705: export 128 bytes with the label "client EAP
- * encryption" and an empty context. MSK = bytes 0..63, EMSK = 64..127.
- * The temporary key material is cleansed and never logged.
+ * RFC 5216 2.3 / RFC 5281 7.1 / RFC 5705: export 128 bytes with the
+ * method-specific label and an empty context. MSK = bytes 0..63, EMSK =
+ * 64..127. EAP-TLS uses "client EAP encryption" (RFC 5216 2.3); EAP-TTLS
+ * uses "ttls keying material" (RFC 5281 7.1). The temporary key material is
+ * cleansed and never logged.
  */
 static int eap_derive_keys(tac_session *session, struct eap_session *es)
 {
+    tac_realm *r = session->ctx->realm;
+    const char *label;
+    size_t label_len;
     u_char keymat[128];
 
+    if (r->eap_method == S_ttls) {
+	label = "ttls keying material";
+	label_len = 20;
+    } else {
+	label = "client EAP encryption";
+	label_len = 21;
+    }
+
     if (SSL_export_keying_material(es->ssl, keymat, sizeof(keymat),
-				   "client EAP encryption", 21, NULL, 0, 0) != 1) {
+				   label, label_len, NULL, 0, 0) != 1) {
 	OPENSSL_cleanse(keymat, sizeof(keymat));
 	eap_tls_fail(session, es, "key export");
 	return 0;
@@ -1533,9 +1546,10 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 	    eap_tls_fail(session, es, "client certificate verification");
 	    return;
 	}
-	/* EAP-TTLS keying material is exported by the inner-method cut
-	   (Task 24); the tunnel itself does not need it. */
-	if (type == EAP_TYPE_TLS && !eap_derive_keys(session, es))
+	/* Export the method-specific keying material once the handshake is
+	   complete (RFC 5216 2.3 for EAP-TLS, RFC 5281 7.1 for EAP-TTLS). A
+	   key-export failure fails the conversation closed. */
+	if (!eap_derive_keys(session, es))
 	    return;
     } else {
 	err = SSL_get_error(es->ssl, ret);
@@ -1819,6 +1833,23 @@ static void eap_ttls_phase2_request(tac_session *session, struct eap_session *es
     }
 
     eap_cache_profile_attrs(es, session);
+#ifdef WITH_CRYPTO
+    if (!eap_add_mppe(session, es)) {
+	/* Never send an Access-Accept without keys. The profile AVPs must not
+	   ride on the Access-Reject: drop them from both the reply buffer and
+	   the replay cache, and start the failure reply from an empty
+	   attribute buffer. */
+	free(es->profile_attrs);
+	es->profile_attrs = NULL;
+	es->profile_attrs_len = 0;
+	if (session->radius_data)
+	    session->radius_data->data_len = 0;
+	es->flags |= EAP_F_FAILED;
+	eap_ttls_avp_reset(es);
+	eap_send_failure(session, es, parsed->identifier);
+	return;
+    }
+#endif
     es->flags |= EAP_F_COMPLETED;
     es->expires = io_now.tv_sec + EAP_COMPLETED_GRACE;
     eap_ttls_avp_reset(es);
