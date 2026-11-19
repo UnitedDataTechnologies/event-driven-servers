@@ -111,13 +111,17 @@ int eap_has_message(rad_pak_hdr *pak)
  * Concatenate the EAP-Message (79) attribute values in packet order.
  * RFC 3579 3.1 requires them to be consecutive. An EAP-Message attribute
  * with a zero-length value is EAP-Start: success with *eap_len == 0.
- * The buffer comes from the tac_session pool and is valid until the session
- * is cleaned up.
+ * On failure, *identifier carries the first two concatenated EAP octets'
+ * Identifier when they were seen, so the caller can send an EAP-Failure
+ * that names the client's identifier. The buffer comes from the
+ * tac_session pool and is valid until the session is cleaned up.
  */
-static int eap_collect(tac_session *session, u_char **eap, size_t *eap_len)
+static int eap_collect(tac_session *session, u_char **eap, size_t *eap_len,
+		       u_char *identifier)
     __attribute__((unused));
 
-static int eap_collect(tac_session *session, u_char **eap, size_t *eap_len)
+static int eap_collect(tac_session *session, u_char **eap, size_t *eap_len,
+		       u_char *identifier)
 {
     struct radius_data *rd;
     u_char *p, *e;
@@ -125,6 +129,8 @@ static int eap_collect(tac_session *session, u_char **eap, size_t *eap_len)
 
     *eap = NULL;
     *eap_len = 0;
+    if (identifier)
+	*identifier = 0;
 
     if (!session || !session->ctx || !session->ctx->realm ||
 	!session->radius_data || !session->radius_data->pak_in)
@@ -137,12 +143,28 @@ static int eap_collect(tac_session *session, u_char **eap, size_t *eap_len)
     max = (size_t) session->ctx->realm->eap_max_message;
 
     int seen = 0, block_done = 0;
+    u_char idbuf[2];
+    size_t idlen = 0;
     while (p + 2 <= e) {
 	size_t alen = p[1];
 	if (alen < 2 || alen > (size_t) (e - p))
 	    return 0;
 	if (p[0] == RADIUS_A_EAP_MESSAGE) {
 	    size_t vlen = alen - 2;
+	    /*
+	     * Keep the first two EAP octets even when the message is rejected
+	     * below: Code and Identifier let an EAP-Failure name the client's
+	     * identifier, as RFC 3748 requires.
+	     */
+	    if (identifier && idlen < sizeof(idbuf)) {
+		size_t take = sizeof(idbuf) - idlen;
+		if (take > vlen)
+		    take = vlen;
+		memcpy(idbuf + idlen, p + 2, take);
+		idlen += take;
+		if (idlen == sizeof(idbuf))
+		    *identifier = idbuf[1];
+	    }
 	    if (block_done)
 		return 0;	/* EAP-Message attributes must be consecutive */
 	    seen = 1;
@@ -1899,16 +1921,17 @@ void eap_radius_request(tac_session *session)
     const u_char *state;
     u_char *eap;
     size_t eap_len, state_len;
-    u_char identifier;
+    u_char identifier, collected_identifier;
 
     if (session->ctx->radius_1_1 == BISTATE_YES) {
 	eap_send_failure(session, NULL, 0);
 	return;
     }
 
-    if (!eap_collect(session, &eap, &eap_len) ||
+    if (!eap_collect(session, &eap, &eap_len, &collected_identifier) ||
 	!eap_get_state(session, &state, &state_len)) {
-	eap_send_failure(session, NULL, eap_len >= 2 ? eap[1] : 0);
+	eap_send_failure(session, NULL,
+			 eap_len >= 2 ? eap[1] : collected_identifier);
 	return;
     }
 
