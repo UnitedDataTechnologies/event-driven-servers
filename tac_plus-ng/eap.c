@@ -803,9 +803,10 @@ static void eap_send_start(tac_session *session, struct eap_session *es, tac_rea
 }
 
 /*
- * Lazily create the server SSL object for an EAP session. SSL_set_bio()
- * hands the memory BIOs to the SSL object; eap_session_free() frees them
- * with SSL_free().
+ * Lazily create the server SSL object for an EAP-TLS or EAP-TTLS session.
+ * Both methods share the same TLS 1.2 server profile and SSL/BIO setup;
+ * SSL_set_bio() hands the memory BIOs to the SSL object, and
+ * eap_session_free() frees them with SSL_free().
  */
 static int eap_tls_start(struct eap_session *es, tac_realm *r)
 {
@@ -910,13 +911,18 @@ static int eap_tls_queue(struct eap_session *es, const u_char *buf, size_t len)
 }
 
 /*
- * Send the next EAP-Request/EAP-TLS fragment of the queued flight in an
- * Access-Challenge with State. The EAP identifier is incremented per
- * fragment; reserved bits are zero. Returns 1 on success, 0 when there is
- * nothing to send, -1 after sending EAP-Failure (the tac_session is gone).
+ * Send the next EAP-Request fragment of the queued flight in an
+ * Access-Challenge with State. EAP-TLS uses type 13 and a flags byte;
+ * EAP-TTLS uses type 21, a flags byte and the Version byte (RFC 5216 3.1,
+ * RFC 5281 3.1). The EAP identifier is incremented per fragment; reserved
+ * bits are zero. Returns 1 on success, 0 when there is nothing to send,
+ * -1 after sending EAP-Failure (the tac_session is gone).
  */
 static int eap_tls_send_fragment(tac_session *session, struct eap_session *es)
 {
+    tac_realm *r = session->ctx->realm;
+    u_char type = eap_method_type(r);
+    size_t hdr = type == EAP_TYPE_TTLS ? 3 : 2;	/* type + flags (+ version) */
     size_t remain, chunk, len, off;
     u_char flags = 0;
     u_char identifier;
@@ -929,9 +935,9 @@ static int eap_tls_send_fragment(tac_session *session, struct eap_session *es)
     chunk = remain > EAP_MAX_FRAGMENT ? EAP_MAX_FRAGMENT : remain;
     identifier = (u_char) (es->identifier + 1);
 
-    len = sizeof(struct eap_hdr) + 2 + chunk;	/* type and flags */
+    len = sizeof(struct eap_hdr) + hdr + chunk;
     if (!es->out_offset)
-	len += 4;				/* TLS Message Length */
+	len += 4;		/* TLS Message Length */
 
     pkt = mem_alloc(session->mem, len);
     if (!pkt) {
@@ -939,16 +945,18 @@ static int eap_tls_send_fragment(tac_session *session, struct eap_session *es)
 	return -1;
     }
 
-    struct eap_hdr hdr = { EAP_CODE_REQUEST, identifier, htons((u_short) len) };
-    memcpy(pkt, &hdr, sizeof(hdr));
-    off = sizeof(hdr);
-    pkt[off++] = EAP_TYPE_TLS;
+    struct eap_hdr eap_hdr = { EAP_CODE_REQUEST, identifier, htons((u_short) len) };
+    memcpy(pkt, &eap_hdr, sizeof(eap_hdr));
+    off = sizeof(eap_hdr);
+    pkt[off++] = type;
 
     if (!es->out_offset)
 	flags |= EAP_TLS_FLAG_L;
     if (es->out_offset + chunk < es->out_total)
 	flags |= EAP_TLS_FLAG_M;
     pkt[off++] = flags;
+    if (type == EAP_TYPE_TTLS)
+	pkt[off++] = es->ttls_version;
 
     if (!es->out_offset) {
 	uint32_t total = htonl((uint32_t) es->out_total);
@@ -987,12 +995,16 @@ static int eap_tls_has_alert(const u_char *buf, size_t len)
 
 /*
  * Handshake failure. Send the TLS alert, if OpenSSL produced one, in an
- * EAP-Request/EAP-TLS (Access-Challenge) and wait for the peer's response;
- * otherwise send EAP-Failure directly. The EAP session stays in the realm
- * tree: the reply helper frees the tac_session, not the eap_session.
+ * EAP-Request of the configured method (Access-Challenge) and wait for the
+ * peer's response; otherwise send EAP-Failure directly. The EAP session
+ * stays in the realm tree: the reply helper frees the tac_session, not the
+ * eap_session.
  */
 static void eap_tls_fail(tac_session *session, struct eap_session *es, const char *reason)
 {
+    tac_realm *r = session->ctx->realm;
+    u_char type = eap_method_type(r);
+    const char *method = type == EAP_TYPE_TTLS ? "EAP-TTLS" : "EAP-TLS";
     u_char *buf = NULL;
     size_t len = 0;
     unsigned long err = ERR_get_error();
@@ -1000,15 +1012,15 @@ static void eap_tls_fail(tac_session *session, struct eap_session *es, const cha
     es->flags |= EAP_F_FAILED;
     if (err) {
 	char ebuf[256];
-	report(session, LOG_ERR, ~0, "EAP-TLS handshake failed: %s: %s",
-	       reason, ERR_error_string(err, ebuf));
+	report(session, LOG_ERR, ~0, "%s handshake failed: %s: %s",
+	       method, reason, ERR_error_string(err, ebuf));
     } else
-	report(session, LOG_ERR, ~0, "EAP-TLS handshake failed: %s", reason);
+	report(session, LOG_ERR, ~0, "%s handshake failed: %s", method, reason);
 
     if (eap_tls_drain(es, &buf, &len) && len && eap_tls_has_alert(buf, len)) {
 	es->tls_state = EAP_TLS_ALERT_SENT;
 	es->flags |= EAP_F_ALERT_SENT;
-	eap_send_request(session, es, EAP_TYPE_TLS, 0, buf, len, 1);
+	eap_send_request(session, es, type, 0, buf, len, 1);
 	free(buf);
 	return;
     }
@@ -1040,14 +1052,17 @@ static int eap_derive_keys(tac_session *session, struct eap_session *es)
 }
 
 /*
- * Empty EAP-Response/EAP-TLS with State: a fragment ACK or the final
- * handshake ACK (RFC 5216 2.1.5 / 2.1.3). Fragment ACKs move the queued
- * server flight forward one fragment at a time; only the ACK for the last
- * server fragment completes the handshake and allows EAP-Success.
+ * Empty EAP-Response of the configured method with State: a fragment ACK or
+ * the final handshake ACK (RFC 5216 2.1.5 / 2.1.3, RFC 5281 3.2). Fragment
+ * ACKs move the queued server flight forward one fragment at a time. The
+ * ACK for the last server fragment completes the TLS handshake: EAP-TLS
+ * authorizes the certificate identity and sends EAP-Success; EAP-TTLS enters
+ * phase 2 by starting it with an empty EAP-Request/TTLS (no AVPs, Version 0).
  */
 static void eap_tls_ack(tac_session *session, struct eap_session *es,
 			const struct eap_parsed *parsed)
 {
+    tac_realm *r = session->ctx->realm;
     int sent;
 
     switch (es->tls_state) {
@@ -1073,8 +1088,17 @@ static void eap_tls_ack(tac_session *session, struct eap_session *es,
 	    return;
 	}
 	es->tls_state = EAP_TLS_DONE;
-	es->flags |= EAP_F_COMPLETED;
 	es->success_identifier = parsed->identifier;
+	if (r->eap_method == S_ttls) {
+	    /* RFC 5281 7.2: the server starts phase 2. This cut sends an
+	       empty EAP-Request/TTLS (no AVPs, Version 0); Task 22 parses the
+	       client's phase-2 AVPs. */
+	    es->ttls_phase = EAP_TTLS_PHASE2;
+	    es->expires = io_now.tv_sec + r->eap_timeout;
+	    eap_send_request(session, es, EAP_TYPE_TTLS, 0, NULL, 0, 1);
+	    return;
+	}
+	es->flags |= EAP_F_COMPLETED;
 	es->expires = io_now.tv_sec + EAP_COMPLETED_GRACE;
 	eap_identity_authorize(session, es, parsed->identifier);
 	return;
@@ -1120,15 +1144,19 @@ static int eap_tls_append(struct eap_session *es, const u_char *data, size_t len
 }
 
 /*
- * EAP-Response/EAP-TLS with State: reassemble client fragments (RFC 5216
- * 2.1.5), feed the complete TLS message to the server SSL object and send
- * its output as EAP-Request/EAP-TLS fragments. The final TLS flight is
- * followed by a peer ACK before EAP-Success (Task 11).
+ * EAP-Response with State for the TLS tunnel (EAP-TLS or EAP-TTLS):
+ * reassemble client fragments (RFC 5216 2.1.5, RFC 5281 3.2), feed the
+ * complete TLS message to the shared server SSL object and send its output
+ * as fragments of the configured method. The final TLS flight is followed
+ * by a peer ACK: EAP-TLS then sends EAP-Success, EAP-TTLS starts phase 2.
  */
 static void eap_tls_request(tac_session *session, struct eap_session *es,
 			    const struct eap_parsed *parsed)
 {
     tac_realm *r = session->ctx->realm;
+    u_char type = eap_method_type(r);
+    u_char flag_l = type == EAP_TYPE_TTLS ? EAP_TTLS_FLAG_L : EAP_TLS_FLAG_L;
+    u_char flag_m = type == EAP_TYPE_TTLS ? EAP_TTLS_FLAG_M : EAP_TLS_FLAG_M;
     const u_char *tls_data = parsed->data;
     size_t tls_data_len = parsed->data_len;
     int reassembled = 0;
@@ -1143,7 +1171,7 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 	return;
     }
 
-    /* An empty EAP-Response/EAP-TLS is a fragment or completion ACK. */
+    /* An empty EAP-Response is a fragment or completion ACK. */
     if (!parsed->data_len) {
 	eap_tls_ack(session, es, parsed);
 	return;
@@ -1160,20 +1188,20 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
     }
 
     /*
-     * Client-to-server fragmentation (RFC 5216 2.1.5). L is only valid on
-     * the first fragment and carries the 4-octet TLS Message Length; M is
-     * set on all but the last fragment. A response with neither flag and no
-     * pending reassembly feeds parsed->data directly.
+     * Client-to-server fragmentation (RFC 5216 2.1.5, RFC 5281 3.2). L is
+     * only valid on the first fragment and carries the 4-octet TLS Message
+     * Length; M is set on all but the last fragment. A response with neither
+     * flag and no pending reassembly feeds parsed->data directly.
      */
-    if (parsed->flags & (EAP_TLS_FLAG_L | EAP_TLS_FLAG_M) || es->tls_len || es->tls_total) {
+    if (parsed->flags & (flag_l | flag_m) || es->tls_len || es->tls_total) {
 	/* RFC 5216 2.1.5: L is set on the first fragment of a fragmented
 	   TLS message. A first fragment with M but no L is malformed. */
 	if (!es->tls_len && !es->tls_total &&
-	    (parsed->flags & EAP_TLS_FLAG_M) && !(parsed->flags & EAP_TLS_FLAG_L)) {
+	    (parsed->flags & flag_m) && !(parsed->flags & flag_l)) {
 	    eap_send_failure(session, es, parsed->identifier);
 	    return;
 	}
-	if (parsed->flags & EAP_TLS_FLAG_L) {
+	if (parsed->flags & flag_l) {
 	    uint32_t total;
 
 	    if (es->tls_len || es->tls_total) {
@@ -1202,9 +1230,9 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 	    return;
 	}
 
-	if (parsed->flags & EAP_TLS_FLAG_M) {
-	    /* Fragment ACK: empty EAP-Request/EAP-TLS, incremented identifier. */
-	    eap_send_request(session, es, EAP_TYPE_TLS, 0, NULL, 0, 1);
+	if (parsed->flags & flag_m) {
+	    /* Fragment ACK: empty EAP-Request of the configured method. */
+	    eap_send_request(session, es, type, 0, NULL, 0, 1);
 	    return;
 	}
 
@@ -1245,7 +1273,9 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 	    eap_tls_fail(session, es, "client certificate verification");
 	    return;
 	}
-	if (!eap_derive_keys(session, es))
+	/* EAP-TTLS keying material is exported by the inner-method cut
+	   (Task 24); the tunnel itself does not need it. */
+	if (type == EAP_TYPE_TLS && !eap_derive_keys(session, es))
 	    return;
     } else {
 	err = SSL_get_error(es->ssl, ret);
@@ -1266,8 +1296,16 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 	    /* Defensive: the handshake completed with no server output left
 	       to send, so there is no final flight to ACK. */
 	    es->tls_state = EAP_TLS_DONE;
-	    es->flags |= EAP_F_COMPLETED;
 	    es->success_identifier = parsed->identifier;
+	    if (type == EAP_TYPE_TTLS) {
+		/* RFC 5281 7.2: start phase 2 with an empty
+		   EAP-Request/TTLS (no AVPs, Version 0). */
+		es->ttls_phase = EAP_TTLS_PHASE2;
+		es->expires = io_now.tv_sec + r->eap_timeout;
+		eap_send_request(session, es, EAP_TYPE_TTLS, 0, NULL, 0, 1);
+		return;
+	    }
+	    es->flags |= EAP_F_COMPLETED;
 	    es->expires = io_now.tv_sec + EAP_COMPLETED_GRACE;
 	    eap_identity_authorize(session, es, parsed->identifier);
 	}
@@ -1285,7 +1323,8 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 
     if (ret == 1) {
 	/* Final TLS flight (CCS/Finished): fragment it and wait for the
-	   peer's fragment ACKs and final empty ACK before EAP-Success. */
+	   peer's fragment ACKs and final empty ACK. EAP-TLS then authorizes
+	   and sends EAP-Success; EAP-TTLS starts phase 2. */
 	es->tls_state = EAP_TLS_FINAL_FLIGHT_SENDING;
     } else
 	es->tls_state = EAP_TLS_HANDSHAKE;
@@ -1297,23 +1336,12 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 }
 
 /*
- * EAP-TTLS tunnel phase. Task 19 stops at the packet layer: after Start,
- * a client response is accepted as TTLSv0 and then failed because the TLS
- * tunnel, the AVP layer and inner PAP (Tasks 20-23) are not implemented
- * yet. Task 20 replaces this stub with the shared TLS handshake.
- */
-static void eap_ttls_tunnel(tac_session *session, struct eap_session *es,
-			    const struct eap_parsed *parsed)
-{
-    report(session, LOG_WARNING, ~0,
-	   "EAP-TTLS: TLS tunnel is not implemented in this build");
-    eap_send_failure(session, es, parsed->identifier);
-}
-
-/*
- * EAP-Response/EAP-TTLS. The packet layer (Task 19) accepts TTLSv0 only:
- * a response with another version fails the conversation. The S bit is
- * already rejected by eap_parse_hdr() for responses.
+ * EAP-Response/EAP-TTLS. The packet layer accepts TTLSv0 only: a response
+ * with another version fails the conversation. The S bit is already
+ * rejected by eap_parse_hdr() for responses. Phase 1 (the TLS handshake) is
+ * handled by the shared EAP-TLS tunnel code. Phase 2 starts with the empty
+ * EAP-Request/TTLS sent by eap_tls_ack(); Task 20 answers any phase-2
+ * response with EAP-Failure because the AVP layer and inner PAP are Task 22.
  */
 static void eap_ttls_request(tac_session *session, struct eap_session *es,
 			     const struct eap_parsed *parsed)
@@ -1332,7 +1360,16 @@ static void eap_ttls_request(tac_session *session, struct eap_session *es,
 	return;
     }
 
-    eap_ttls_tunnel(session, es, parsed);
+    if (es->ttls_phase == EAP_TTLS_PHASE2) {
+	/* Task 20 stub: no AVP parsing yet. Task 22 replaces this with the
+	   inner PAP conversation. */
+	report(session, LOG_WARNING, ~0,
+	       "EAP-TTLS: phase-2 inner authentication is not implemented in this build");
+	eap_send_failure(session, es, parsed->identifier);
+	return;
+    }
+
+    eap_tls_request(session, es, parsed);
 }
 
 void eap_radius_request(tac_session *session)
