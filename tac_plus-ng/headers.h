@@ -894,6 +894,8 @@ void rad_authen(tac_session *);
 void authen_init(void);
 #ifdef WITH_SSL
 enum token eap_authorize(tac_session * session, char **resp, enum hint_enum * hint);
+enum token eap_ttls_authorize(tac_session * session, const char * username,
+			      const char * password, char **resp, enum hint_enum * hint);
 #endif
 #ifdef WITH_CRYPTO
 void rad_add_mppe_key(tac_session * session, const u_char * key, size_t key_len, u_char attribute);

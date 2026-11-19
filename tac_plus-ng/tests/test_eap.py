@@ -803,6 +803,45 @@ EAP_TTLS_VERIFY_POLICY = eap_policy(method="ttls", inner_method="pap",
                                     identity_source="inner-identity", verify_client="yes",
                                     users=EAP_TTLS_USERS)
 
+# Inner PAP users with local passwords. Kept separate from EAP_TTLS_USERS so
+# the Task 22 tests (which expect the deny stub) keep failing as intended.
+EAP_TTLS_PAP_USERS = """
+\tprofile eap-deny {
+\t\tscript { deny }
+\t}
+\tuser pap-user {
+\t\tpassword pap = clear papsecret
+\t\tprofile = eap-profile
+\t}
+\tuser pap-deny-user {
+\t\tpassword pap = clear papsecret
+\t\tprofile = eap-deny
+\t}
+\tuser pap-mfa-user {
+\t\tpassword pap = clear papsecret
+\t\tmfa = yes
+\t}
+\tuser pap-login-deny-user {
+\t\tpassword pap = clear papsecret
+\t\tpassword login = deny
+\t}
+\tuser pap-login-error-user {
+\t\tpassword pap = clear papsecret
+\t\tpassword login = error
+\t}
+\tuser pap-mavis-user {
+\t\tpassword pap = clear papsecret
+\t\tpassword login = mavis
+\t}
+\tuser pap-nopassword-user {
+\t\tprofile = eap-profile
+\t}
+"""
+
+EAP_TTLS_PAP_POLICY = eap_policy(method="ttls", inner_method="pap",
+                                 identity_source="inner-identity", verify_client="no",
+                                 users=EAP_TTLS_PAP_USERS)
+
 # A second NAS in the same realm: EAP State must not be replayable from it.
 OTHER_NAS_DEVICE = """
 \tdevice other-nas {
@@ -1349,6 +1388,23 @@ class EapTtlsPeer(EapTlsPeer):
         return self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
                                                     self.identifier, 0, data=out))
 
+    def phase2_write_l(self, data, total=None):
+        """Write application data with the TTLS L flag and a TLS Message Length.
+
+        RFC 5281 3.2: L marks the first fragment and carries the four-octet
+        TLS Message Length before the TLS data.
+        """
+        written = self.sslobj.write(data)
+        if written != len(data):
+            raise AssertionError("SSLObject wrote %d of %d bytes" % (written, len(data)))
+        out = self.outgoing.read()
+        if not out:
+            raise AssertionError("SSLObject produced no TLS record for %d bytes" % len(data))
+        return self.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                    self.identifier, radius.EAP_TTLS_L,
+                                                    data=out,
+                                                    total=len(out) if total is None else total))
+
     def phase2_write_split(self, data, split):
         """Send one TLS record split across two EAP-Response/TTLS packets."""
         written = self.sslobj.write(data)
@@ -1799,6 +1855,133 @@ class EapTtlsPhase2(EapTlsTestCase):
         prompt_identifier = peer.expect_phase2_prompt(reply)
         reply = peer.phase2_write(radius.eap_ttls_avp(99, b"xy")[4:])
         self.assertEqual(peer.phase2_failure(reply), prompt_identifier)
+
+
+class EapTtlsPap(EapTlsTestCase):
+    """EAP-TTLS/PAP: inner PAP authentication through the local password path.
+
+    The outer EAP-Response/Identity is anonymous; authorization uses the
+    inner User-Name and User-Password AVPs (RFC 5281 7.3).
+    """
+
+    POLICY = EAP_TTLS_PAP_POLICY
+
+    def peer(self, outer_identity="anonymous"):
+        return EapTtlsPeer(self.radius("radsecret"), self.ca, outer_identity)
+
+    @staticmethod
+    def pap_avps(user_name=b"pap-user", password=b"papsecret"):
+        return radius.eap_ttls_avps(radius.eap_ttls_avp(radius.AVP_USER_NAME, user_name),
+                                    radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, password))
+
+    def phase2(self, user_name=b"pap-user", password=b"papsecret"):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(self.pap_avps(user_name, password))
+        return peer, phase2_identifier, reply
+
+    def assert_success(self, reply, identifier):
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        eap = radius.eap_from_reply(reply)
+        self.assertEqual(len(eap), 4, eap)
+        self.assertEqual(struct.unpack("!BBH", eap),
+                         (radius.EAP_SUCCESS, identifier, 4))
+        self.assertFalse(reply.get(radius.STATE))
+
+    def assert_failure(self, peer, reply, identifier):
+        self.assertEqual(peer.phase2_failure(reply), identifier)
+
+    def test_valid_local_pap_user_is_accepted(self):
+        peer, identifier, reply = self.phase2()
+        self.assert_success(reply, identifier)
+        self.assertEqual(cisco_avpairs(reply), [b"shell:priv-lvl=15"],
+                         "profile attribute missing from Access-Accept")
+
+    def test_wrong_password_is_rejected(self):
+        peer, identifier, reply = self.phase2(password=b"wrong")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_unknown_user_is_rejected(self):
+        peer, identifier, reply = self.phase2(user_name=b"nobody")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_profile_deny_is_rejected(self):
+        peer, identifier, reply = self.phase2(user_name=b"pap-deny-user")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_mfa_required_user_is_rejected(self):
+        """MFA cannot be challenged inside EAP-TTLS; do not bypass it."""
+        peer, identifier, reply = self.phase2(user_name=b"pap-mfa-user")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_login_deny_user_is_rejected(self):
+        peer, identifier, reply = self.phase2(user_name=b"pap-login-deny-user")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_login_error_user_is_rejected(self):
+        peer, identifier, reply = self.phase2(user_name=b"pap-login-error-user")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_mavis_only_login_user_is_rejected(self):
+        """MAVIS cannot be challenged inside EAP-TTLS in this cut."""
+        peer, identifier, reply = self.phase2(user_name=b"pap-mavis-user")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_missing_user_name_is_rejected(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(radius.eap_ttls_avp(radius.AVP_USER_PASSWORD, b"papsecret"))
+        self.assert_failure(peer, reply, phase2_identifier)
+
+    def test_empty_user_name_is_rejected(self):
+        peer, identifier, reply = self.phase2(user_name=b"")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_missing_user_password_is_rejected(self):
+        peer = self.peer()
+        _, phase2_identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(radius.eap_ttls_avp(radius.AVP_USER_NAME, b"pap-user"))
+        self.assert_failure(peer, reply, phase2_identifier)
+
+    def test_empty_user_password_is_rejected(self):
+        peer, identifier, reply = self.phase2(password=b"")
+        self.assert_failure(peer, reply, identifier)
+
+    def test_nul_padded_password_is_accepted(self):
+        """RFC 2865 5.2: the PAP password may be NUL-padded to 16 octets."""
+        peer, identifier, reply = self.phase2(password=b"papsecret" + bytes(7))
+        self.assert_success(reply, identifier)
+
+    def test_overlong_password_is_rejected(self):
+        peer, identifier, reply = self.phase2(password=b"x" * 129)
+        self.assert_failure(peer, reply, identifier)
+
+    def test_outer_anonymous_identity_is_ignored(self):
+        """The inner User-Name authorizes; the outer identity is not used."""
+        peer = self.peer(outer_identity="anonymous")
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(self.pap_avps(b"pap-user", b"papsecret"))
+        self.assert_success(reply, identifier)
+
+    def test_outer_identity_does_not_authorize_inner_user(self):
+        """An outer identity naming a valid user must not mask an unknown inner user."""
+        peer = self.peer(outer_identity="pap-user")
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write(self.pap_avps(b"nobody", b"papsecret"))
+        self.assert_failure(peer, reply, identifier)
+
+    def test_phase2_l_flag_with_valid_total_is_accepted(self):
+        """RFC 5281 3.2: L carries the TLS Message Length, skipped before BIO_write."""
+        peer = self.peer()
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write_l(self.pap_avps())
+        self.assert_success(reply, identifier)
+
+    def test_phase2_l_flag_total_over_max_message_is_rejected(self):
+        peer = self.peer()
+        _, identifier, _ = peer.handshake_phase2()
+        reply = peer.phase2_write_l(self.pap_avps(), total=70000)
+        self.assert_failure(peer, reply, identifier)
 
 
 class EapTtlsFragmentedServerFlight(EapTlsTestCase):

@@ -1596,22 +1596,6 @@ static void eap_tls_request(tac_session *session, struct eap_session *es,
 }
 
 /*
- * Task 22 stub: inner PAP authorization is Task 23. User-Name and
- * User-Password have been parsed and bounds-checked; this build has no
- * EAP-TTLS password backend yet, so every PAP request is denied. Neither
- * argument is logged.
- */
-static enum token eap_ttls_authorize(tac_session *session, const char *username,
-				     const char *password)
-{
-    (void) username;
-    (void) password;
-    report(session, LOG_WARNING, ~0,
-	   "EAP-TTLS: inner PAP authorization is not implemented in this build");
-    return S_deny;
-}
-
-/*
  * Fail the phase-2 conversation closed: log a non-sensitive reason, drop the
  * decrypted AVP buffer (which may contain the cleartext password), and send
  * EAP-Failure with the client's identifier.
@@ -1631,17 +1615,18 @@ static void eap_ttls_phase2_fail(tac_session *session, struct eap_session *es,
  * decrypted AVP stream, and parse a sequence that may be split across TLS
  * records and EAP-TTLS packets.
  *
- * This cut implements the state machine and PAP value validation only:
- * User-Name/User-Password are required, and eap_ttls_authorize() is a Task 22
- * stub that denies every request. Task 23 replaces the stub with the real
- * authorization path; Task 24 exports keys. Never log AVP data: the
- * User-Password is cleartext inside TLS.
+ * PAP requires User-Name and User-Password. The inner identity is authorized
+ * through the local password path (eap_ttls_authorize()); a permit sends
+ * EAP-Success with the profile AVPs. Never log AVP data: the User-Password is
+ * cleartext inside TLS.
  */
 static void eap_ttls_phase2_request(tac_session *session, struct eap_session *es,
 				    const struct eap_parsed *parsed)
 {
     tac_realm *r = session->ctx->realm;
     size_t max = (size_t) r->eap_max_message;
+    const u_char *tls_data = parsed->data;
+    size_t tls_data_len = parsed->data_len;
     u_char tmp[4096];
     int n, err;
 
@@ -1651,17 +1636,41 @@ static void eap_ttls_phase2_request(tac_session *session, struct eap_session *es
 	return;
     }
 
+    /*
+     * RFC 5281 3.2: L is set on the first fragment and the four-octet TLS
+     * Message Length precedes the TLS data. Validate the announced length
+     * against max-message and skip it before feeding the tunnel.
+     */
+    if (parsed->flags & EAP_TTLS_FLAG_L) {
+	uint32_t total;
+
+	if (tls_data_len < sizeof(total)) {
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "phase-2 L flag without TLS Message Length");
+	    return;
+	}
+	memcpy(&total, tls_data, sizeof(total));
+	total = ntohl(total);
+	if (total < 1 || total > (uint32_t) max) {
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "phase-2 TLS Message Length exceeds max-message");
+	    return;
+	}
+	tls_data += sizeof(total);
+	tls_data_len -= sizeof(total);
+    }
+
     /* An empty response cannot carry AVPs. A fragment with M set is answered
        with an empty request below. */
-    if (!parsed->data_len && !(parsed->flags & EAP_TTLS_FLAG_M)) {
+    if (!tls_data_len && !(parsed->flags & EAP_TTLS_FLAG_M)) {
 	eap_ttls_phase2_fail(session, es, parsed->identifier,
 			     "empty phase-2 response");
 	return;
     }
 
-    if (parsed->data_len &&
-	BIO_write(es->rbio, parsed->data, (int) parsed->data_len) !=
-	(int) parsed->data_len) {
+    if (tls_data_len &&
+	BIO_write(es->rbio, tls_data, (int) tls_data_len) !=
+	(int) tls_data_len) {
 	eap_ttls_phase2_fail(session, es, parsed->identifier,
 			     "phase-2 BIO_write failed");
 	return;
@@ -1738,7 +1747,10 @@ static void eap_ttls_phase2_request(tac_session *session, struct eap_session *es
 	const u_char *user_name = NULL, *user_password = NULL;
 	size_t user_name_len = 0, user_password_len = 0, off = 0;
 	int have_user_name = 0, have_user_password = 0;
+	char username[EAP_TTLS_MAX_USER_NAME + 1];
 	char password[EAP_TTLS_MAX_USER_PASSWORD + 1];
+	enum hint_enum hint = hint_nosuchuser;
+	char *resp = NULL;
 	enum token res;
 
 	while (eap_ttls_avp_next(es->avp_in, es->avp_len, &off, max, &avp) ==
@@ -1778,36 +1790,39 @@ static void eap_ttls_phase2_request(tac_session *session, struct eap_session *es
 	    return;
 	}
 
+	memcpy(username, user_name, user_name_len);
+	username[user_name_len] = 0;
 	memcpy(password, user_password, user_password_len);
 	password[user_password_len] = 0;
 
 	/* RFC 5281 7.3: the inner User-Name is authoritative; the outer
 	   EAP-Response/Identity (typically "anonymous") is not used. */
 	str_set(&session->username,
-		mem_strndup(session->mem, (u_char *) user_name, user_name_len),
+		mem_strndup(session->mem, (u_char *) username, user_name_len),
 		user_name_len);
 	if (!session->username.txt) {
+	    OPENSSL_cleanse(username, sizeof(username));
 	    OPENSSL_cleanse(password, sizeof(password));
 	    eap_ttls_phase2_fail(session, es, parsed->identifier,
 				 "out of memory storing inner User-Name");
 	    return;
 	}
 
-	res = eap_ttls_authorize(session, session->username.txt, password);
+	res = eap_ttls_authorize(session, username, password, &resp, &hint);
+	OPENSSL_cleanse(username, sizeof(username));
 	OPENSSL_cleanse(password, sizeof(password));
 	if (res != S_permit) {
-	    es->flags |= EAP_F_FAILED;
-	    eap_ttls_avp_reset(es);
-	    eap_send_failure(session, es, parsed->identifier);
+	    eap_ttls_phase2_fail(session, es, parsed->identifier,
+				 "inner PAP authorization denied");
 	    return;
 	}
     }
 
-    /* Task 22 must not report success for a parsed AVP sequence: the real
-       authorization path is Task 23 and key export is Task 24. */
-    es->flags |= EAP_F_FAILED;
+    eap_cache_profile_attrs(es, session);
+    es->flags |= EAP_F_COMPLETED;
+    es->expires = io_now.tv_sec + EAP_COMPLETED_GRACE;
     eap_ttls_avp_reset(es);
-    eap_send_failure(session, es, parsed->identifier);
+    eap_send_success(session, es, parsed->identifier);
 }
 
 /*
@@ -1816,7 +1831,7 @@ static void eap_ttls_phase2_request(tac_session *session, struct eap_session *es
  * rejected by eap_parse_hdr() for responses. Phase 1 (the TLS handshake) is
  * handled by the shared EAP-TLS tunnel code. Phase 2 starts with the empty
  * EAP-Request/TTLS sent by eap_tls_ack(); eap_ttls_phase2_request() reads the
- * decrypted AVPs and runs the Task 22 PAP state machine.
+ * decrypted AVPs, runs the PAP state machine and authorizes the inner user.
  */
 static void eap_ttls_request(tac_session *session, struct eap_session *es,
 			     const struct eap_parsed *parsed)
