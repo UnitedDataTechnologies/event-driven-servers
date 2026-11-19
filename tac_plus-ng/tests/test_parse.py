@@ -110,6 +110,9 @@ NEEDS_OPENSSL_CONFIGS = (
     "bad-eap-identity-source.cfg", "bad-eap-identity-verify.cfg",
     "bad-eap-timeout.cfg", "bad-eap-max-message-low.cfg",
     "bad-eap-max-message-high.cfg", "bad-eap-max-sessions.cfg",
+    "good-eap-ttls.cfg", "bad-eap-ttls-inner-method.cfg",
+    "bad-eap-ttls-identity-source.cfg", "bad-eap-tls-inner-identity.cfg",
+    "bad-eap-tls-inner-method.cfg", "bad-eap-ttls-verify-client-no-ca.cfg",
 )
 
 SANITIZER_TEXT = ("Sanitizer", "runtime error")
@@ -399,6 +402,45 @@ class EapConfigValidation(unittest.TestCase):
     @unittest.skipUnless("openssl" in features(), "the realm eap block needs an OpenSSL build")
     def test_max_sessions_below_one_is_rejected(self):
         self.assert_value_error("\t\tmax-sessions = 0", "EAP max-sessions must be positive")
+
+
+class EapTtlsConfigValidation(unittest.TestCase):
+    """EAP-TTLS/PAP configuration: the good combination parses, incompatible ones do not."""
+
+    def assert_config_error(self, name, text):
+        path = os.path.join(CONFIGS, name)
+        code, out = check(path)
+        self.assertGreater(code, 0, out)
+        self.assertIn(text, out)
+
+    @unittest.skipUnless("openssl" in features(), "the realm eap block needs an OpenSSL build")
+    def test_good_ttls_config_parses(self):
+        code, out = check(os.path.join(CONFIGS, "good-eap-ttls.cfg"))
+        self.assertEqual(code, 0, out)
+
+    @unittest.skipUnless("openssl" in features(), "the realm eap block needs an OpenSSL build")
+    def test_unsupported_inner_method_is_rejected(self):
+        self.assert_config_error("bad-eap-ttls-inner-method.cfg", "Expected pap")
+
+    @unittest.skipUnless("openssl" in features(), "the realm eap block needs an OpenSSL build")
+    def test_ttls_rejects_certificate_identity_source(self):
+        self.assert_config_error("bad-eap-ttls-identity-source.cfg",
+                                 "EAP-TTLS requires eap-identity-source = inner-identity")
+
+    @unittest.skipUnless("openssl" in features(), "the realm eap block needs an OpenSSL build")
+    def test_tls_rejects_inner_identity(self):
+        self.assert_config_error("bad-eap-tls-inner-identity.cfg",
+                                 "eap-identity-source = inner-identity is only valid for EAP-TTLS")
+
+    @unittest.skipUnless("openssl" in features(), "the realm eap block needs an OpenSSL build")
+    def test_tls_rejects_inner_method(self):
+        self.assert_config_error("bad-eap-tls-inner-method.cfg",
+                                 "eap-inner-method is only valid for EAP-TTLS")
+
+    @unittest.skipUnless("openssl" in features(), "the realm eap block needs an OpenSSL build")
+    def test_ttls_verify_client_requires_ca_file(self):
+        self.assert_config_error("bad-eap-ttls-verify-client-no-ca.cfg",
+                                 "EAP verify-client requires ca-file")
 
 
 class OwnConfigs(unittest.TestCase):

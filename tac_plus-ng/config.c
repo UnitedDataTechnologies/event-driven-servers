@@ -483,8 +483,12 @@ void complete_realm(tac_realm *r)
 	RS(eap_cafile, NULL);
 	RS(eap_pass, NULL);
 	/* A realm with its own eap {} block must not inherit the lab-only
-	   identity settings of its parent; apply the method defaults instead. */
+	   identity settings or the method of its parent; apply the method
+	   defaults instead. Scalar "eap = yes" takes the parent's settings
+	   over here, after parsing knows whether there is an eap block. */
 	if (!r->eap_config) {
+	    RS(eap_method, S_unknown);
+	    RS(eap_inner_method, S_unknown);
 	    RS(eap_identity_source, S_unknown);
 	    RS(eap_verify_client, -1);
 	}
@@ -550,10 +554,51 @@ void complete_realm(tac_realm *r)
     }
 #ifdef WITH_SSL
     if (r->eap == TRISTATE_YES) {
-	if (r->eap_verify_client < 0)
-	    r->eap_verify_client = 1;
-	if (r->eap_identity_source == S_unknown)
-	    r->eap_identity_source = S_cert_cn;
+	if (r->eap_method == S_unknown)
+	    r->eap_method = S_tls;
+
+	if (r->eap_method == S_ttls) {
+	    if (r->eap_inner_method == S_unknown)
+		r->eap_inner_method = S_pap;
+	    if (r->eap_inner_method != S_pap) {
+		report_cfg_error(LOG_ERR, ~0,
+				 "%s: realm %s: EAP-TTLS requires eap-inner-method = pap",
+				 common_data.conffile, r->name.txt);
+		exit(EX_SOFTWARE);
+	    }
+	    if (r->eap_identity_source == S_unknown)
+		r->eap_identity_source = S_inner_identity;
+	    if (r->eap_identity_source != S_inner_identity) {
+		report_cfg_error(LOG_ERR, ~0,
+				 "%s: realm %s: EAP-TTLS requires eap-identity-source = inner-identity",
+				 common_data.conffile, r->name.txt);
+		exit(EX_SOFTWARE);
+	    }
+	    if (r->eap_verify_client < 0)
+		r->eap_verify_client = 0;
+	} else if (r->eap_method == S_tls) {
+	    if (r->eap_inner_method != S_unknown) {
+		report_cfg_error(LOG_ERR, ~0,
+				 "%s: realm %s: eap-inner-method is only valid for EAP-TTLS",
+				 common_data.conffile, r->name.txt);
+		exit(EX_SOFTWARE);
+	    }
+	    if (r->eap_identity_source == S_unknown)
+		r->eap_identity_source = S_cert_cn;
+	    if (r->eap_identity_source == S_inner_identity) {
+		report_cfg_error(LOG_ERR, ~0,
+				 "%s: realm %s: eap-identity-source = inner-identity is only valid for EAP-TTLS",
+				 common_data.conffile, r->name.txt);
+		exit(EX_SOFTWARE);
+	    }
+	    if (r->eap_verify_client < 0)
+		r->eap_verify_client = 1;
+	} else {
+	    report_cfg_error(LOG_ERR, ~0,
+			     "%s: realm %s: eap-method must be tls or ttls",
+			     common_data.conffile, r->name.txt);
+	    exit(EX_SOFTWARE);
+	}
 	if (r->eap_timeout < 0)
 	    r->eap_timeout = EAP_DEFAULT_TIMEOUT;
 	if (r->eap_max_message < 0)
@@ -588,23 +633,25 @@ void complete_realm(tac_realm *r)
 			   common_data.conffile, r->name.txt);
 	    exit(EX_SOFTWARE);
 	}
-	if (r->eap_verify_client && r->eap_identity_source == S_eap_identity) {
-	    report_cfg_error(LOG_ERR, ~0,
+	if (r->eap_method == S_tls) {
+	    if (r->eap_verify_client && r->eap_identity_source == S_eap_identity) {
+		report_cfg_error(LOG_ERR, ~0,
 		   "%s: realm %s: eap-identity-source = eap-identity requires verify-client = no (RFC 5216 2.2)",
 		   common_data.conffile, r->name.txt);
-	    exit(EX_SOFTWARE);
-	}
-	if (!r->eap_verify_client &&
-	    r->eap_identity_source != S_eap_identity) {
-	    report_cfg_error(LOG_ERR, ~0,
+		exit(EX_SOFTWARE);
+	    }
+	    if (!r->eap_verify_client &&
+		r->eap_identity_source != S_eap_identity) {
+		report_cfg_error(LOG_ERR, ~0,
 		   "%s: realm %s: EAP verify-client = no requires eap-identity-source = eap-identity",
 		   common_data.conffile, r->name.txt);
-	    exit(EX_SOFTWARE);
-	}
-	if (!r->eap_verify_client)
-	    report_cfg_error(LOG_WARNING, ~0,
+		exit(EX_SOFTWARE);
+	    }
+	    if (!r->eap_verify_client)
+		report_cfg_error(LOG_WARNING, ~0,
 		   "%s: realm %s: EAP identity is unauthenticated (lab use only)",
 		   common_data.conffile, r->name.txt);
+	}
 
 	/* Realms are never freed in this daemon: the configuration is read
 	   once at startup, and a reload restarts the daemon process, so the
@@ -769,6 +816,8 @@ static tac_realm *new_realm(char *name, tac_realm *parent)
     r->tls_verify_depth = -1;
     r->tls_psk_key_exchange = S_unknown;
     r->eap_verify_client = -1;
+    r->eap_method = S_unknown;
+    r->eap_inner_method = S_unknown;
     r->eap_timeout = -1;
     r->eap_max_message = -1;
     r->eap_max_sessions = -1;
@@ -2316,8 +2365,18 @@ void parse_decls_real(struct sym *sym, tac_realm *r)
 		case S_eap_method:
 		    sym_get(sym);
 		    parse(sym, S_equal);
-		    parse(sym, S_tls);
-		    break;
+		    switch (sym->code) {
+		    case S_tls:
+			r->eap_method = S_tls;
+			break;
+		    case S_ttls:
+			r->eap_method = S_ttls;
+			break;
+		    default:
+			parse_error(sym, "Expected tls or ttls");
+		    }
+		    sym_get(sym);
+		    continue;
 		case S_cert_file:
 		    sym_get(sym);
 		    parse(sym, S_equal);
@@ -2349,6 +2408,14 @@ void parse_decls_real(struct sym *sym, tac_realm *r)
 		    parse(sym, S_equal);
 		    r->eap_verify_client = parse_bool(sym);
 		    continue;
+		case S_eap_inner_method:
+		    sym_get(sym);
+		    parse(sym, S_equal);
+		    if (sym->code != S_pap)
+			parse_error(sym, "Expected pap (the only supported EAP-TTLS inner method)");
+		    r->eap_inner_method = S_pap;
+		    sym_get(sym);
+		    continue;
 		case S_eap_identity_source:
 		    sym_get(sym);
 		    parse(sym, S_equal);
@@ -2362,8 +2429,11 @@ void parse_decls_real(struct sym *sym, tac_realm *r)
 		    case S_eap_identity:
 			r->eap_identity_source = S_eap_identity;
 			break;
+		    case S_inner_identity:
+			r->eap_identity_source = S_inner_identity;
+			break;
 		    default:
-			parse_error(sym, "Expected cert-cn, cert-san, or eap-identity");
+			parse_error(sym, "Expected cert-cn, cert-san, eap-identity, or inner-identity");
 		    }
 		    sym_get(sym);
 		    continue;
@@ -2410,7 +2480,8 @@ void parse_decls_real(struct sym *sym, tac_realm *r)
 		    }
 		    continue;
 		default:
-		    parse_error_expect(sym, S_eap_method, S_cert_file, S_key_file,
+		    parse_error_expect(sym, S_eap_method, S_eap_inner_method,
+				       S_cert_file, S_key_file,
 				       S_cafile, S_passphrase, S_verify_client,
 				       S_eap_identity_source, S_timeout,
 				       S_max_message, S_max_sessions,

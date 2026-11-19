@@ -640,4 +640,8 @@ cert-san		S_cert_san
 eap-identity		S_eap_identity
 max-message		S_max_message
 max-sessions		S_max_sessions
+# EAP-TTLS/PAP (RFC 5281) configuration; pap already exists above
+ttls			S_ttls
+inner-identity		S_inner_identity
+eap-inner-method	S_eap_inner_method
 #
