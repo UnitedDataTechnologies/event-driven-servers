@@ -506,7 +506,9 @@ struct realm {
     char *eap_cafile;
     char *eap_pass;
     int eap_config;		/* realm has its own eap {} block */
-    enum token eap_identity_source;	/* S_cert_cn, S_cert_san, S_eap_identity */
+    enum token eap_method;	/* S_tls or S_ttls */
+    enum token eap_inner_method;	/* S_pap for EAP-TTLS */
+    enum token eap_identity_source;	/* S_cert_cn, S_cert_san, S_eap_identity, S_inner_identity */
     int eap_verify_client;
     int eap_timeout;
     int eap_max_message;
