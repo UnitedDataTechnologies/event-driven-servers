@@ -1954,6 +1954,40 @@ class EapTtlsHandshake(EapTlsTestCase):
         self.assertNotEqual(phase2_identifier, ack_identifier)
         self.assertTrue(reply.get(radius.STATE), "phase-2 request without State")
 
+    def test_single_final_ack_starts_phase2(self):
+        """A single-fragment final flight is completed by one client ACK.
+
+        eapol_test sends exactly one empty EAP-Response/TTLS after the server
+        final flight; the server must enter phase 2 then, not wait for a
+        second ACK.
+        """
+        peer = self.peer()
+        peer.start()
+        for _ in range(10):
+            try:
+                peer.sslobj.do_handshake()
+            except ssl.SSLWantReadError:
+                out = peer.outgoing.read()
+                if not out:
+                    raise AssertionError("SSLObject wants to read but has no output")
+                reply = peer.send_tls_flight(out)
+                _, data = peer.receive_request(reply)
+                peer.incoming.write(data)
+                continue
+            except ssl.SSLWantWriteError:
+                peer.outgoing.read()
+                continue
+            break
+        reply = peer.send_eap(radius.eap_ttls_packet(radius.EAP_RESPONSE,
+                                                     peer.identifier, 0))
+        self.assertEqual(reply.code_name, "Access-Challenge", reply)
+        identifier, flags, version, data, _ = peer.parse_ttls_request(
+            radius.eap_from_reply(reply))
+        self.assertEqual(flags, 0, flags)
+        self.assertEqual(version, radius.EAP_TTLS_VERSION, version)
+        self.assertEqual(data, b"", data)
+        self.assertNotEqual(identifier, peer.identifier)
+
     def test_phase2_response_gets_eap_failure(self):
         """An empty phase-2 response is invalid and fails closed."""
         peer = self.peer()
@@ -2148,6 +2182,29 @@ class EapTtlsPap(EapTlsTestCase):
 
     def assert_failure(self, peer, reply, identifier):
         self.assertEqual(peer.phase2_failure(reply), identifier)
+
+    def test_phase2_data_without_empty_final_ack_is_accepted(self):
+        """eapol_test sends phase-2 data as the next response, without a separate ACK."""
+        peer = self.peer()
+        peer.start()
+        for _ in range(10):
+            try:
+                peer.sslobj.do_handshake()
+            except ssl.SSLWantReadError:
+                out = peer.outgoing.read()
+                if not out:
+                    raise AssertionError("SSLObject wants to read but has no output")
+                reply = peer.send_tls_flight(out)
+                _, data = peer.receive_request(reply)
+                peer.incoming.write(data)
+                continue
+            except ssl.SSLWantWriteError:
+                peer.outgoing.read()
+                continue
+            break
+        reply = peer.phase2_write(self.pap_avps())
+        self.assertEqual(reply.code_name, "Access-Accept", reply)
+        self.assert_success(reply, peer.identifier)
 
     def test_valid_local_pap_user_is_accepted(self):
         peer, identifier, reply = self.phase2()

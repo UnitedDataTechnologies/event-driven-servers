@@ -1564,6 +1564,31 @@ static int eap_derive_keys(tac_session *session, struct eap_session *es)
 }
 
 /*
+ * Finish the TLS handshake once the peer has acknowledged the last server
+ * fragment. EAP-TLS authorizes the certificate identity and sends
+ * EAP-Success; EAP-TTLS starts phase 2 with an empty EAP-Request/TTLS.
+ */
+static void eap_tls_complete(tac_session *session, struct eap_session *es,
+			     u_char identifier)
+{
+    tac_realm *r = session->ctx->realm;
+
+    es->tls_state = EAP_TLS_DONE;
+    es->success_identifier = identifier;
+    if (r->eap_method == S_ttls) {
+	/* RFC 5281 7.2: the server starts phase 2. */
+	es->ttls_phase = EAP_TTLS_PHASE2;
+	es->expires = io_now.tv_sec + r->eap_timeout;
+	eap_send_request(session, es, EAP_TYPE_TTLS, 0, NULL, 0, 1);
+	return;
+    }
+    es->flags |= EAP_F_COMPLETED;
+    es->expires = io_now.tv_sec + EAP_COMPLETED_GRACE;
+    eap_hold_context(session, es);
+    eap_identity_authorize(session, es, identifier);
+}
+
+/*
  * Empty EAP-Response of the configured method with State: a fragment ACK or
  * the final handshake ACK (RFC 5216 2.1.5 / 2.1.3, RFC 5281 3.2). Fragment
  * ACKs move the queued server flight forward one fragment at a time. The
@@ -1574,15 +1599,25 @@ static int eap_derive_keys(tac_session *session, struct eap_session *es)
 static void eap_tls_ack(tac_session *session, struct eap_session *es,
 			const struct eap_parsed *parsed)
 {
-    tac_realm *r = session->ctx->realm;
     int sent;
 
     switch (es->tls_state) {
     case EAP_TLS_FINAL_FLIGHT_SENDING:
-	/* More final-flight fragments are queued: one fragment per ACK. */
+	/*
+	 * A final flight may be one fragment (the common case) or several.
+	 * If there is no next fragment, this ACK was for the last fragment
+	 * and completes the handshake; do not wait for a second ACK that
+	 * EAP peers such as eapol_test do not send. If a next fragment was
+	 * sent, wait for its ACK; when the last fragment has just been sent,
+	 * the next ACK completes the handshake.
+	 */
 	sent = eap_tls_send_fragment(session, es);
 	if (sent < 0)
 	    return;
+	if (!sent) {
+	    eap_tls_complete(session, es, parsed->identifier);
+	    return;
+	}
 	if (es->out_offset >= es->out_total)
 	    es->tls_state = EAP_TLS_WAIT_FINAL_ACK;
 	return;
@@ -1599,21 +1634,7 @@ static void eap_tls_ack(tac_session *session, struct eap_session *es,
 	    eap_send_failure(session, es, parsed->identifier);
 	    return;
 	}
-	es->tls_state = EAP_TLS_DONE;
-	es->success_identifier = parsed->identifier;
-	if (r->eap_method == S_ttls) {
-	    /* RFC 5281 7.2: the server starts phase 2. This cut sends an
-	       empty EAP-Request/TTLS (no AVPs, Version 0); Task 22 parses the
-	       client's phase-2 AVPs. */
-	    es->ttls_phase = EAP_TTLS_PHASE2;
-	    es->expires = io_now.tv_sec + r->eap_timeout;
-	    eap_send_request(session, es, EAP_TYPE_TTLS, 0, NULL, 0, 1);
-	    return;
-	}
-	es->flags |= EAP_F_COMPLETED;
-	es->expires = io_now.tv_sec + EAP_COMPLETED_GRACE;
-	eap_hold_context(session, es);
-	eap_identity_authorize(session, es, parsed->identifier);
+	eap_tls_complete(session, es, parsed->identifier);
 	return;
     default:
 	/* ALERT_SENT and FAILED are handled by the caller; an ACK in DONE or
@@ -2119,6 +2140,27 @@ static void eap_ttls_request(tac_session *session, struct eap_session *es,
 	       parsed->version, EAP_TTLS_VERSION);
 	es->flags |= EAP_F_FAILED;
 	eap_send_failure(session, es, parsed->identifier);
+	return;
+    }
+
+    /*
+     * eapol_test and some supplicants do not send a separate empty
+     * EAP-Response/TTLS ACK after the server's final TLS flight; their next
+     * EAP-Response carries the phase-2 TLS application data. When the
+     * handshake is complete, the final flight has been fully sent and this
+     * packet is non-empty, treat it as both the final ACK and the first
+     * phase-2 input.
+     */
+    if (es->ttls_phase == EAP_TTLS_PHASE1 &&
+	(es->flags & EAP_F_HANDSHAKE_DONE) && parsed->data_len > 0 &&
+	(es->tls_state == EAP_TLS_FINAL_FLIGHT_SENDING ||
+	 es->tls_state == EAP_TLS_WAIT_FINAL_ACK) &&
+	(!es->out || es->out_offset >= es->out_total)) {
+	es->tls_state = EAP_TLS_DONE;
+	es->success_identifier = parsed->identifier;
+	es->ttls_phase = EAP_TTLS_PHASE2;
+	es->expires = io_now.tv_sec + session->ctx->realm->eap_timeout;
+	eap_ttls_phase2_request(session, es, parsed);
 	return;
     }
 
