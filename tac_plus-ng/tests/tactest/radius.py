@@ -36,7 +36,8 @@
 
 EAP helpers (RFC 3748, RFC 5216, RFC 5281, RFC 3579): eap_packet(),
 eap_tls_packet() and eap_ttls_packet() build EAP packets, eap_tls_ack() the
-empty fragment ACK, eap_ttls_start() an EAP-Request/TTLS Start,
+empty fragment ACK, eap_ttls_start() an EAP-Request/TTLS Start (type 21 and
+one Flags byte, with the Version in its low three bits),
 eap_attributes() splits an EAP packet into 253-byte EAP-Message attributes,
 and eap_from_reply() concatenates them again.
 
@@ -76,7 +77,8 @@ EAP_TLS_L = 0x80
 EAP_TLS_M = 0x40
 EAP_TLS_S = 0x20
 
-# EAP-TTLS (RFC 5281 3.1): type 21, the same L/M/S bits, and Version 0
+# EAP-TTLS (RFC 5281 3.1): type 21, the same L/M/S bits, and Version 0 in
+# the low three bits of the Flags byte.
 EAP_TYPE_TTLS = 21
 EAP_TTLS_L = 0x80
 EAP_TTLS_M = 0x40
@@ -206,12 +208,13 @@ def eap_tls_ack(identifier):
 
 
 def eap_ttls_packet(code, identifier, flags, version=EAP_TTLS_VERSION, data=b"", total=None):
-    """EAP-TTLS packet: type 21, flags byte, version byte, optional 4-byte total length.
+    """EAP-TTLS packet: type 21 and one Flags byte (Version in the low 3 bits).
 
-    RFC 5281 3.1: the flags use the EAP-TLS bit values; Version 0 is TTLSv0.
-    With L set, the four-octet TLS Message Length follows the version byte.
+    RFC 5281 3.1: L/M/S use the EAP-TLS bit values; the Version occupies
+    the low three bits of the same Flags byte (TTLSv0 is 0). With L set,
+    the four-octet TLS Message Length follows the Flags byte.
     """
-    body = bytes([EAP_TYPE_TTLS, flags, version])
+    body = bytes([EAP_TYPE_TTLS, (flags & 0xE0) | (version & 0x07)])
     if flags & EAP_TTLS_L:
         body += struct.pack("!I", total if total is not None else len(data))
     body += data
@@ -219,7 +222,10 @@ def eap_ttls_packet(code, identifier, flags, version=EAP_TTLS_VERSION, data=b"",
 
 
 def eap_ttls_start(identifier):
-    """EAP-Request/EAP-TTLS Start: type 21, S set, version 0, no data (RFC 5281 3.1)."""
+    """EAP-Request/EAP-TTLS Start: type 21, S set, Version 0, no data (RFC 5281 3.1).
+
+    Six bytes: the 4-byte EAP header, the type and the Flags byte.
+    """
     return eap_ttls_packet(EAP_REQUEST, identifier, EAP_TTLS_S)
 
 

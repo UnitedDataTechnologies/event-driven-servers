@@ -253,8 +253,9 @@ struct eap_parsed {
  * - at least the 4-byte header must be present;
  * - the declared length must be >= 4 and must not exceed the buffer;
  * - octets beyond the declared length are padding and are ignored;
- * - EAP-TLS has one flags byte; EAP-TTLS has a flags byte and a version
- *   byte, and L carries a 4-octet TLS Message Length;
+ * - EAP-TLS has one flags byte; EAP-TTLS has one flags byte whose low
+ *   three bits carry the Version, and L carries a 4-octet TLS Message
+ *   Length;
  * - an S bit in an EAP-Response is rejected;
  * - reserved bits are ignored on receive (cleared in *out).
  */
@@ -299,14 +300,14 @@ static int eap_parse_hdr(const u_char *eap, size_t eap_len, struct eap_parsed *o
 	out->flags &= EAP_TLS_FLAG_L | EAP_TLS_FLAG_M | EAP_TLS_FLAG_S;
 	off++;
     } else if (out->type == EAP_TYPE_TTLS) {
-	if (length < off + 2)
-	    return 0;		/* flags and version bytes are mandatory */
+	if (length < off + 1)
+	    return 0;		/* flags byte, with Version in the low bits */
 	out->flags = eap[off];
-	out->version = eap[off + 1];
 	if (hdr.code == EAP_CODE_RESPONSE && (out->flags & EAP_TTLS_FLAG_S))
 	    return 0;		/* RFC 5281 3.1 */
+	out->version = out->flags & EAP_TTLS_VERSION_MASK;
 	out->flags &= EAP_TTLS_FLAG_L | EAP_TTLS_FLAG_M | EAP_TTLS_FLAG_S;
-	off += 2;
+	off++;
 	if ((out->flags & EAP_TTLS_FLAG_L) && length < off + 4)
 	    return 0;		/* L carries a 4-octet TLS Message Length */
     }
@@ -1013,11 +1014,12 @@ static void eap_send_nak(tac_session *session, struct eap_session *es, u_char id
  * Send an EAP-Request in an Access-Challenge with the session's State. The
  * server identifier is incremented for every new request and kept in
  * es->identifier (the last identifier sent). EAP-TLS carries a flags byte;
- * EAP-TTLS carries a flags byte and the version byte (TTLSv0 only). Reserved
- * bits are zero on send (RFC 5216 3.1, RFC 5281 3.1). Replies to requests
- * carrying State are cached (cache != 0) under the identifier of the request
- * being answered; replies to no-State requests are not, because those create
- * a new session and are never looked up by identifier.
+ * EAP-TTLS carries one flags byte that also holds the Version in its low
+ * three bits (TTLSv0 only). Reserved bits are zero on send (RFC 5216 3.1,
+ * RFC 5281 3.1). Replies to requests carrying State are cached (cache != 0)
+ * under the identifier of the request being answered; replies to no-State
+ * requests are not, because those create a new session and are never looked
+ * up by identifier.
  */
 static void eap_send_request(tac_session *session, struct eap_session *es,
 			     u_char type, u_char flags, const u_char *data, size_t data_len,
@@ -1031,7 +1033,7 @@ static void eap_send_request(tac_session *session, struct eap_session *es,
     if (type == EAP_TYPE_TLS)
 	len++;
     else if (type == EAP_TYPE_TTLS)
-	len += 2;		/* flags and version */
+	len++;			/* flags byte, Version in the low bits */
 
     pkt = mem_alloc(session->mem, len);
     if (!pkt) {
@@ -1046,10 +1048,9 @@ static void eap_send_request(tac_session *session, struct eap_session *es,
     pkt[off++] = type;
     if (type == EAP_TYPE_TLS)
 	pkt[off++] = flags & (EAP_TLS_FLAG_L | EAP_TLS_FLAG_M | EAP_TLS_FLAG_S);
-    else if (type == EAP_TYPE_TTLS) {
-	pkt[off++] = flags & (EAP_TTLS_FLAG_L | EAP_TTLS_FLAG_M | EAP_TTLS_FLAG_S);
-	pkt[off++] = es->ttls_version;
-    }
+    else if (type == EAP_TYPE_TTLS)
+	pkt[off++] = (flags & (EAP_TTLS_FLAG_L | EAP_TTLS_FLAG_M | EAP_TTLS_FLAG_S)) |
+		     (es->ttls_version & EAP_TTLS_VERSION_MASK);
     if (data_len)
 	memcpy(pkt + off, data, data_len);
 
@@ -1195,16 +1196,17 @@ static int eap_tls_queue(struct eap_session *es, const u_char *buf, size_t len)
 /*
  * Send the next EAP-Request fragment of the queued flight in an
  * Access-Challenge with State. EAP-TLS uses type 13 and a flags byte;
- * EAP-TTLS uses type 21, a flags byte and the Version byte (RFC 5216 3.1,
- * RFC 5281 3.1). The EAP identifier is incremented per fragment; reserved
- * bits are zero. Returns 1 on success, 0 when there is nothing to send,
- * -1 after sending EAP-Failure (the tac_session is gone).
+ * EAP-TTLS uses type 21 and one flags byte that also holds the Version in
+ * its low three bits (RFC 5216 3.1, RFC 5281 3.1). The EAP identifier is
+ * incremented per fragment; reserved bits are zero. Returns 1 on success,
+ * 0 when there is nothing to send, -1 after sending EAP-Failure (the
+ * tac_session is gone).
  */
 static int eap_tls_send_fragment(tac_session *session, struct eap_session *es)
 {
     tac_realm *r = session->ctx->realm;
     u_char type = eap_method_type(r);
-    size_t hdr = type == EAP_TYPE_TTLS ? 3 : 2;	/* type + flags (+ version) */
+    size_t hdr = 2;		/* type + flags; TTLS Version is in flags */
     size_t remain, chunk, len, off;
     u_char flags = 0;
     u_char identifier;
@@ -1238,7 +1240,7 @@ static int eap_tls_send_fragment(tac_session *session, struct eap_session *es)
 	flags |= EAP_TLS_FLAG_M;
     pkt[off++] = flags;
     if (type == EAP_TYPE_TTLS)
-	pkt[off++] = es->ttls_version;
+	pkt[off - 1] |= es->ttls_version & EAP_TTLS_VERSION_MASK;
 
     if (!es->out_offset) {
 	uint32_t total = htonl((uint32_t) es->out_total);
