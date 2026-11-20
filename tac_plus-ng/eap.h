@@ -59,11 +59,14 @@
 #define EAP_TLS_FLAG_S      0x20
 #define EAP_TLS_FLAG_RESERVED 0x1f	/* Request; Response reserved is 0x3f */
 
-/* EAP-TTLS (RFC 5281 3.1): same L/M/S bit values as EAP-TLS, Version 0. */
+/* EAP-TTLS (RFC 5281 3.1): same L/M/S bit values as EAP-TLS. The single
+   Flags byte also carries the Version in its low three bits (TTLSv0 = 0);
+   bits 0x18 are reserved. */
 #define EAP_TTLS_FLAG_L     0x80
 #define EAP_TTLS_FLAG_M     0x40
 #define EAP_TTLS_FLAG_S     0x20
-#define EAP_TTLS_FLAG_RESERVED 0x1f
+#define EAP_TTLS_FLAG_RESERVED 0x18
+#define EAP_TTLS_VERSION_MASK 0x07
 #define EAP_TTLS_VERSION    0
 
 /* EAP-TTLS AVPs (RFC 5281 10.1): 4-octet code, flags, 3-octet length,

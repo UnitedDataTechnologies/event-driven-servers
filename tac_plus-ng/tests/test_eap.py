@@ -31,7 +31,7 @@
 The end-to-end EAP-TLS conversations come later; these tests pin the wire
 format (RFC 3748, RFC 5216 3.1/3.2, RFC 5281 3.1): EAP header lengths,
 EAP-Message splitting at 253 bytes, State extraction, and the EAP-TLS and
-EAP-TTLS flags/version.
+EAP-TTLS flags (with the EAP-TTLS Version in the flags' low bits).
 """
 
 import hashlib
@@ -206,38 +206,38 @@ class EapPacket(unittest.TestCase):
         self.assertEqual(ack[5] & 0x3f, 0)
 
     def test_ttls_packet_round_trip(self):
-        """Type 21, flags byte, Version byte, then the data (RFC 5281 3.1)."""
+        """Type 21, one Flags byte with Version in its low bits, then the data."""
         data = b"\x16\x03\x03" + bytes(5)
         packet = radius.eap_ttls_packet(radius.EAP_REQUEST, 3, radius.EAP_TTLS_S, data=data)
         code, identifier, length = struct.unpack("!BBH", packet[:4])
         self.assertEqual((code, identifier, length), (radius.EAP_REQUEST, 3, len(packet)))
         self.assertEqual(packet[4], radius.EAP_TYPE_TTLS)
         self.assertEqual(packet[5], radius.EAP_TTLS_S)
-        self.assertEqual(packet[6], radius.EAP_TTLS_VERSION)
-        self.assertEqual(packet[7:], data)
+        self.assertEqual(packet[5] & 0x07, radius.EAP_TTLS_VERSION)
+        self.assertEqual(packet[6:], data)
 
-    def test_ttls_start_is_seven_bytes_with_s_and_version_zero(self):
-        """EAP-Request/TTLS Start: the header, type, S flag and Version 0 only."""
+    def test_ttls_start_is_six_bytes_with_s_and_version_zero(self):
+        """EAP-Request/TTLS Start: the header, type 21 and one Flags byte."""
         start = radius.eap_ttls_start(1)
-        self.assertEqual(len(start), 7)
-        self.assertEqual(start, struct.pack("!BBH", radius.EAP_REQUEST, 1, 7) +
-                         bytes([radius.EAP_TYPE_TTLS, radius.EAP_TTLS_S, 0]))
+        self.assertEqual(len(start), 6)
+        self.assertEqual(start, struct.pack("!BBH", radius.EAP_REQUEST, 1, 6) +
+                         bytes([radius.EAP_TYPE_TTLS, radius.EAP_TTLS_S]))
 
     def test_ttls_l_flag_carries_total_length(self):
-        """L includes the 4-byte TLS Message Length after the version byte."""
+        """L puts the 4-byte TLS Message Length immediately after Flags."""
         data = b"x" * 10
         packet = radius.eap_ttls_packet(radius.EAP_RESPONSE, 2, radius.EAP_TTLS_L | radius.EAP_TTLS_M,
                                         data=data, total=1000)
-        self.assertEqual(len(packet), 4 + 1 + 1 + 1 + 4 + len(data))
-        self.assertEqual(struct.unpack("!I", packet[7:11])[0], 1000)
-        self.assertEqual(packet[11:], data)
+        self.assertEqual(len(packet), 4 + 1 + 1 + 4 + len(data))
+        self.assertEqual(struct.unpack("!I", packet[6:10])[0], 1000)
+        self.assertEqual(packet[10:], data)
 
     def test_ttls_reserved_bits_are_zero(self):
-        """Generated TTLS packets use only L/M/S; the reserved bits stay zero."""
-        self.assertEqual(radius.eap_ttls_start(1)[5] & 0x1f, 0)
+        """Generated TTLS packets use only L/M/S; reserved bits 0x18 stay zero."""
+        self.assertEqual(radius.eap_ttls_start(1)[5] & 0x18, 0)
         first = radius.eap_ttls_packet(radius.EAP_REQUEST, 2,
                                        radius.EAP_TTLS_L | radius.EAP_TTLS_M, data=b"x", total=1)
-        self.assertEqual(first[5] & 0x1f, 0)
+        self.assertEqual(first[5] & 0x18, 0)
 
 
 EAP_STATE_LEN = 16
@@ -258,10 +258,10 @@ def eap_parse_hdr(eap):
 
     Returns code/identifier/length/type/flags/version/data. Raises ValueError
     for a header shorter than 4 bytes, a declared length below 4 or beyond
-    the buffer, a missing type/flags/version byte, the S bit in an
-    EAP-Response, or an L flag without the 4-octet TLS Message Length.
-    Trailing bytes beyond the declared length are padding and ignored.
-    Reserved flag bits are ignored on receive.
+    the buffer, a missing type/flags byte, an L flag without the 4-octet
+    TLS Message Length, or the S bit in an EAP-Response. Trailing bytes
+    beyond the declared length are padding and ignored. Reserved flag bits
+    are ignored on receive.
     """
     if len(eap) < 4:
         raise ValueError("EAP packet shorter than the 4-byte header")
@@ -289,14 +289,14 @@ def eap_parse_hdr(eap):
         if parsed["flags"] & radius.EAP_TLS_L and length < off + 4:
             raise ValueError("L bit set without the 4-byte TLS Message Length")
     elif eap_type == radius.EAP_TYPE_TTLS:
-        if length < 7:
-            raise ValueError("EAP-TTLS without a flags and version byte")
+        if length < 6:
+            raise ValueError("EAP-TTLS without a flags byte")
         flags = eap[5]
         if code == radius.EAP_RESPONSE and flags & radius.EAP_TTLS_S:
             raise ValueError("S bit set in EAP-Response/EAP-TTLS")
+        parsed["version"] = flags & 0x07
         parsed["flags"] = flags & (radius.EAP_TTLS_L | radius.EAP_TTLS_M | radius.EAP_TTLS_S)
-        parsed["version"] = eap[6]
-        off = 7
+        off = 6
         if parsed["flags"] & radius.EAP_TTLS_L and length < off + 4:
             raise ValueError("EAP-TTLS L flag without a 4-byte TLS Message Length")
     parsed["data"] = eap[off:length]
@@ -519,21 +519,23 @@ class EapParsing(unittest.TestCase):
             eap_parse_hdr(eap)
 
     def test_eap_ttls_reserved_bits_ignored_on_receive(self):
-        """Reserved bits are ignored, not rejected."""
-        eap = radius.eap_ttls_packet(radius.EAP_RESPONSE, 2, 0x01, data=b"abc")
+        """Reserved bits 0x18 are ignored, not rejected."""
+        data = b"abc"
+        eap = struct.pack("!BBH", radius.EAP_RESPONSE, 2, 6 + len(data)) + \
+            bytes([radius.EAP_TYPE_TTLS, 0x18]) + data
         parsed = eap_parse_hdr(eap)
         self.assertEqual(parsed["flags"], 0)
         self.assertEqual(parsed["version"], 0)
-        self.assertEqual(parsed["data"], b"abc")
+        self.assertEqual(parsed["data"], data)
 
     def test_eap_ttls_version_is_parsed(self):
-        """The version byte is exposed to the TTLS handler for negotiation."""
+        """The Version in the Flags low bits is exposed for negotiation."""
         eap = radius.eap_ttls_packet(radius.EAP_RESPONSE, 2, 0, version=1)
         self.assertEqual(eap_parse_hdr(eap)["version"], 1)
 
     def test_eap_ttls_short_packets_are_rejected(self):
-        """An EAP-TTLS packet needs the type, flags and version byte."""
-        for length in (4, 5, 6):
+        """An EAP-TTLS packet needs at least the type and flags bytes."""
+        for length in (4, 5):
             body = bytes([radius.EAP_TYPE_TTLS, 0, 0])[:max(0, length - 4)]
             eap = struct.pack("!BBH", radius.EAP_RESPONSE, 1, length) + body
             with self.assertRaises(ValueError):
@@ -541,10 +543,47 @@ class EapParsing(unittest.TestCase):
 
     def test_eap_ttls_l_flag_without_length_is_rejected(self):
         """L carries a 4-octet TLS Message Length (RFC 5281 3.2)."""
-        eap = struct.pack("!BBH", radius.EAP_RESPONSE, 1, 7) + \
-            bytes([radius.EAP_TYPE_TTLS, radius.EAP_TTLS_L, 0])
+        eap = struct.pack("!BBH", radius.EAP_RESPONSE, 1, 6) + \
+            bytes([radius.EAP_TYPE_TTLS, radius.EAP_TTLS_L])
         with self.assertRaises(ValueError):
             eap_parse_hdr(eap)
+
+
+class EapTtlsWireFormat(unittest.TestCase):
+    """RFC 5281 3.1: EAP-TTLS has one Flags byte; Version is in its low bits.
+
+    The packet is the 4-octet EAP header, type 21, one Flags byte where
+    L=0x80, M=0x40, S=0x20, reserved bits are 0x18 and the Version is in
+    bits 0-2, then the optional 4-octet TLS Message Length when L is set,
+    then the data.
+    """
+
+    def test_ttls_start_is_six_bytes_with_s_and_version_zero(self):
+        """Start: header, type 21 and one Flags byte (S set, Version 0)."""
+        start = radius.eap_ttls_start(7)
+        self.assertEqual(len(start), 6, start)
+        self.assertEqual(start[4], radius.EAP_TYPE_TTLS, start)
+        self.assertEqual(start[5] & radius.EAP_TTLS_S, radius.EAP_TTLS_S, start)
+        self.assertEqual(start[5] & 0x07, 0, start)
+
+    def test_ttls_version_one_in_flags_low_bits_is_parsed(self):
+        """A Version 1 in bits 0-2 of Flags is parsed as version 1."""
+        eap = struct.pack("!BBH", radius.EAP_RESPONSE, 1, 6) + \
+            bytes([radius.EAP_TYPE_TTLS, 0x01])
+        parsed = eap_parse_hdr(eap)
+        self.assertEqual(parsed["version"], 1, parsed)
+        self.assertEqual(parsed["flags"], 0, parsed)
+        self.assertEqual(parsed["data"], b"", parsed)
+
+    def test_ttls_l_flag_length_follows_the_flags_byte(self):
+        """L: the 4-octet TLS Message Length starts right after Flags."""
+        data = b"\x16\x03\x03" + bytes(4)
+        packet = radius.eap_ttls_packet(radius.EAP_REQUEST, 2,
+                                        radius.EAP_TTLS_L, data=data, total=1234)
+        self.assertEqual(packet[4], radius.EAP_TYPE_TTLS, packet)
+        self.assertEqual(packet[5], radius.EAP_TTLS_L, packet)
+        self.assertEqual(struct.unpack("!I", packet[6:10])[0], 1234, packet)
+        self.assertEqual(packet[10:], data, packet)
 
 
 class EapTtlsAvp(unittest.TestCase):
@@ -1398,12 +1437,12 @@ class EapTlsPeer:
 class EapTtlsPeer(EapTlsPeer):
     """An EAP-TTLS peer over ssl.SSLObject and memory BIOs (TLS 1.2 only).
 
-    Every packet uses the TTLS header: type 21, the L/M/S flags and the
-    Version byte (RFC 5281 3.1). Server fragments are reassembled; each
-    fragment with M set is ACKed with an empty EAP-Response/EAP-TTLS. After
-    the TLS handshake the server starts phase 2 with an empty
-    EAP-Request/EAP-TTLS (no AVPs, Version 0); phase2_write() sends the
-    tunneled AVPs.
+    Every packet uses the TTLS header: type 21 and one Flags byte carrying
+    L/M/S with the Version in its low three bits (RFC 5281 3.1). Server
+    fragments are reassembled; each fragment with M set is ACKed with an
+    empty EAP-Response/EAP-TTLS. After the TLS handshake the server starts
+    phase 2 with an empty EAP-Request/EAP-TTLS (no AVPs, Version 0);
+    phase2_write() sends the tunneled AVPs.
     """
 
     def parse_ttls_request(self, eap):
@@ -1413,19 +1452,20 @@ class EapTtlsPeer(EapTlsPeer):
         code, identifier, length = struct.unpack("!BBH", eap[:4])
         if code != radius.EAP_REQUEST:
             raise AssertionError("expected EAP-Request, got EAP code %d: %r" % (code, eap))
-        if length < 7 or length > len(eap):
+        if length < 6 or length > len(eap):
             raise AssertionError("bad EAP length %d in %r" % (length, eap))
         if eap[4] != radius.EAP_TYPE_TTLS:
             raise AssertionError("expected EAP-TTLS, got EAP type %d" % eap[4])
         flags = eap[5]
-        version = eap[6]
-        off = 7
+        version = flags & 0x07
+        flags &= 0xE0
+        off = 6
         total = None
         if flags & radius.EAP_TTLS_L:
-            if length < 11:
+            if length < 10:
                 raise AssertionError("EAP-TTLS L flag without a 4-byte length")
-            total = struct.unpack("!I", eap[7:11])[0]
-            off = 11
+            total = struct.unpack("!I", eap[6:10])[0]
+            off = 10
         return identifier, flags, version, eap[off:length], total
 
     def expect_fragment_ack(self, reply):
@@ -1771,12 +1811,12 @@ class EapTtlsStart(EapTlsTestCase):
         r = c.exchange(req, message_authenticator=True)
         self.assertEqual(r.code_name, "Access-Challenge", r)
         reply_eap = radius.eap_from_reply(r)
-        self.assertEqual(len(reply_eap), 7, reply_eap)
+        self.assertEqual(len(reply_eap), 6, reply_eap)
         self.assertEqual(reply_eap[0], radius.EAP_REQUEST, reply_eap)
         self.assertEqual(reply_eap[4], radius.EAP_TYPE_TTLS, reply_eap)
         self.assertEqual(reply_eap[5], radius.EAP_TTLS_S, reply_eap)
-        self.assertEqual(reply_eap[6], radius.EAP_TTLS_VERSION, reply_eap)
-        self.assertEqual(reply_eap[7:], b"", reply_eap)
+        self.assertEqual(reply_eap[5] & 0x07, radius.EAP_TTLS_VERSION, reply_eap)
+        self.assertEqual(reply_eap[6:], b"", reply_eap)
         state = (r.get(radius.STATE) or [None])[0]
         self.assertTrue(state, "TTLS Start challenge without State")
         return c, r, state, reply_eap[1]
@@ -1791,11 +1831,12 @@ class EapTtlsStart(EapTlsTestCase):
         self.ttls_start()
 
     def test_ttls_start_does_not_carry_tls_records(self):
-        """Start is the header, type 21, S and Version 0 only (RFC 5281 3.1)."""
+        """Start is the header, type 21 and one Flags byte with S and Version 0."""
         _, _, _, _ = self.ttls_start()
         start = radius.eap_ttls_start(1)
+        self.assertEqual(len(start), 6)
         self.assertEqual(start[5], radius.EAP_TTLS_S)
-        self.assertEqual(start[6], 0)
+        self.assertEqual(start[5] & 0x07, radius.EAP_TTLS_VERSION)
 
     def test_nak_proposing_ttls_gets_ttls_start(self):
         c = self.radius("radsecret")
@@ -1808,7 +1849,7 @@ class EapTtlsStart(EapTlsTestCase):
         reply_eap = radius.eap_from_reply(r)
         self.assertEqual(reply_eap[4], radius.EAP_TYPE_TTLS, reply_eap)
         self.assertEqual(reply_eap[5], radius.EAP_TTLS_S, reply_eap)
-        self.assertEqual(reply_eap[6], radius.EAP_TTLS_VERSION, reply_eap)
+        self.assertEqual(reply_eap[5] & 0x07, radius.EAP_TTLS_VERSION, reply_eap)
 
     def test_eap_start_identity_with_state_gets_ttls_start(self):
         c = self.radius("radsecret")
@@ -1829,12 +1870,22 @@ class EapTtlsStart(EapTlsTestCase):
         reply_eap = radius.eap_from_reply(r2)
         self.assertEqual(reply_eap[4], radius.EAP_TYPE_TTLS, reply_eap)
         self.assertEqual(reply_eap[5], radius.EAP_TTLS_S, reply_eap)
-        self.assertEqual(reply_eap[6], radius.EAP_TTLS_VERSION, reply_eap)
+        self.assertEqual(reply_eap[5] & 0x07, radius.EAP_TTLS_VERSION, reply_eap)
         self.assertEqual(r2.get(radius.STATE), [state], "State must stay the same")
 
     def test_ttls_version_other_than_zero_gets_failure(self):
         c, _, state, identifier = self.ttls_start()
         ttls = radius.eap_ttls_packet(radius.EAP_RESPONSE, identifier, 0, version=1)
+        reply = c.exchange(access_request(ttls, state), message_authenticator=True)
+        self.assertEqual(reply.code_name, "Access-Reject", reply)
+        self.assertEqual(self.failure_identifier(reply), identifier)
+
+    def test_ttls_version_one_in_flags_low_bits_gets_failure(self):
+        """A Version 1 in the Flags low bits is parsed as 1 and gets EAP-Failure."""
+        c, _, state, identifier = self.ttls_start()
+        ttls = struct.pack("!BBH", radius.EAP_RESPONSE, identifier, 6) + \
+            bytes([radius.EAP_TYPE_TTLS, 0x01])
+        self.assertEqual(eap_parse_hdr(ttls)["version"], 1)
         reply = c.exchange(access_request(ttls, state), message_authenticator=True)
         self.assertEqual(reply.code_name, "Access-Reject", reply)
         self.assertEqual(self.failure_identifier(reply), identifier)
@@ -1848,17 +1899,18 @@ class EapTtlsStart(EapTlsTestCase):
         self.assertEqual(self.failure_identifier(reply), identifier)
 
     def test_ttls_reserved_bits_are_ignored(self):
-        """Reserved flag bits are ignored; the tunnel stub then fails cleanly."""
+        """Reserved flag bits 0x18 are ignored; the tunnel stub then fails cleanly."""
         c, _, state, identifier = self.ttls_start()
-        ttls = radius.eap_ttls_packet(radius.EAP_RESPONSE, identifier, 0x01)
+        ttls = struct.pack("!BBH", radius.EAP_RESPONSE, identifier, 6) + \
+            bytes([radius.EAP_TYPE_TTLS, 0x18])
         reply = c.exchange(access_request(ttls, state), message_authenticator=True)
         self.assertEqual(reply.code_name, "Access-Reject", reply)
         self.assertEqual(self.failure_identifier(reply), identifier)
 
     def test_short_ttls_packets_get_failure(self):
-        """A TTLS packet without type/flags/version bytes is malformed."""
+        """A TTLS packet without type/flags bytes is malformed."""
         c, _, state, identifier = self.ttls_start()
-        for length in (4, 5, 6):
+        for length in (4, 5):
             body = bytes([radius.EAP_TYPE_TTLS, 0, 0])[:max(0, length - 4)]
             eap = struct.pack("!BBH", radius.EAP_RESPONSE, identifier, length) + body
             reply = c.exchange(access_request(eap, state), message_authenticator=True)
@@ -1892,13 +1944,13 @@ class EapTtlsHandshake(EapTlsTestCase):
 
         self.assertEqual(reply.code_name, "Access-Challenge", reply)
         eap = radius.eap_from_reply(reply)
-        self.assertEqual(len(eap), 7, eap)
+        self.assertEqual(len(eap), 6, eap)
         self.assertEqual(struct.unpack("!BBH", eap[:4]),
-                         (radius.EAP_REQUEST, phase2_identifier, 7))
+                         (radius.EAP_REQUEST, phase2_identifier, 6))
         self.assertEqual(eap[4], radius.EAP_TYPE_TTLS, eap)
         self.assertEqual(eap[5], 0, eap)
-        self.assertEqual(eap[6], radius.EAP_TTLS_VERSION, eap)
-        self.assertEqual(eap[7:], b"")
+        self.assertEqual(eap[5] & 0x07, radius.EAP_TTLS_VERSION, eap)
+        self.assertEqual(eap[6:], b"")
         self.assertNotEqual(phase2_identifier, ack_identifier)
         self.assertTrue(reply.get(radius.STATE), "phase-2 request without State")
 
@@ -2513,8 +2565,8 @@ class EapTtlsRetransmission(EapTlsTestCase):
         eap = radius.eap_from_reply(resent)
         self.assertEqual(eap[4], radius.EAP_TYPE_TTLS, eap)
         self.assertEqual(eap[5], 0, eap)
-        self.assertEqual(eap[6], radius.EAP_TTLS_VERSION, eap)
-        self.assertEqual(eap[7:], b"")
+        self.assertEqual(eap[5] & 0x07, radius.EAP_TTLS_VERSION, eap)
+        self.assertEqual(eap[6:], b"")
         self.assertNotEqual(eap[1], ack_identifier)
 
     def test_retransmitted_phase2_fragment_ack_gets_cached_reply(self):
