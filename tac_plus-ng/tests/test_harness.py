@@ -48,7 +48,7 @@ import time
 import unittest
 
 from tactest import LINUX, SUPPRESSIONS, Closed, DaemonTestCase, ProtocolError, detect, sanitizers
-from tactest.daemon import proc_stat
+from tactest.daemon import Daemon, features_from_output, proc_stat
 
 POLICY = """
 	device single {
@@ -365,6 +365,35 @@ def quoted_source_values(source, name="TLS_OPTIONS"):
                         and before.value.endswith(("'", '"'))):
                     found.add(value.lineno)
     return sorted(found)
+
+
+class HarnessScans(unittest.TestCase):
+    """The harness reads directives and features from text, not from comments."""
+
+    def test_commented_out_single_process_is_ignored(self):
+        cases = [
+            ("# single process = yes", False),
+            ("\t#single process = yes", False),
+            ("\t# single process = yes\n\tlisten { port = 49 }", False),
+            ("\t# single process = yes\n\t# single process = yes", False),
+            ("\tsingle process = yes", True),
+            ("single process=yes", True),
+            ("\t# single process = yes\n\tsingle process = yes", True),
+        ]
+        for spawnd, expected in cases:
+            with self.subTest(spawnd=spawnd):
+                d = Daemon(spawnd=spawnd)
+                self.addCleanup(d.remove)
+                self.assertIs(d.single_process, expected)
+
+    def test_libressl_counts_as_openssl(self):
+        for out, expected in (
+                ("tac_plus-ng version x/PCRE2/ARES 1.27.0/OpenSSL 3.0.13",
+                 {"pcre2", "openssl", "ares"}),
+                ("tac_plus-ng version x/PCRE2/LibreSSL 3.3.6", {"pcre2", "openssl"}),
+                ("tac_plus-ng version x", set())):
+            with self.subTest(out=out):
+                self.assertEqual(features_from_output(out), expected)
 
 
 class TestFiles(unittest.TestCase):
